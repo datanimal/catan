@@ -196,6 +196,102 @@ raise mean victory points (7.49 against 7.52) — timing and denial are zero-sum
 tempo effects that change who crosses ten first rather than how many points
 anyone accumulates.
 
+## Sequential lookahead, and why denial still does not pay
+
+Scoring single actions greedily cannot represent "play Road Building, lay two
+roads, settle the good spot", because each step on its own looks worse than
+settling whatever is already in reach. A bounded planner now enumerates
+settlement targets up to four roads away, prices the whole package, and lifts
+the first step of the best plan onto the plan's own score.
+
+Getting the *scale* right was the whole difficulty, and the first attempt had
+it wrong. A plan's first step is usually a road, which scores about 16, while
+its competitor is settling a mediocre spot now, which scores about 75 because
+of the large `w_settlement` constant. A bonus of `plan_drive * excess` could
+never close a 59-point gap, so the planner had no effect at any setting. Plans
+are now scored the way `BuildSettlement` is scored, with each road the route
+cannot get free charged at two cards — which is exactly what makes Road
+Building pivotal, since it removes two of those charges.
+
+**It still does not move the win rate, and neither does denial.** The planner
+is not inert, and the counters in `bots.rs` prove it rather than leaving it to
+argument. Over 300 games:
+
+| | count |
+|---|---|
+| decisions that consulted the planner | 24,853 |
+| a settlement was affordable at all | 3,600 |
+| some better spot was reachable | 20,549 |
+| **both, plus a payable route** | **197** |
+| of those, leaning on a Road Building card | 64 |
+| the plan's first step was chosen | 153 |
+| **the plan changed the decision** | **72** |
+
+That is roughly one decision in four games. Better spots are nearly always out
+there (83% of decisions) and the binding constraint is resources: a settlement
+is affordable in 14% of decisions, and only 5.5% of *those* can also pay for a
+route to something better. A play that arises a quarter of a time per game
+cannot shift a win rate however well it is handled.
+
+A plausible explanation — that the 7-card hand limit suppresses it, since
+plowing needs roughly 8 cards of the right types — was tested and is **wrong**:
+raising the limit to 14 changes nothing (24.9%). The bot spends resources the
+moment anything is affordable, so it never accumulates regardless of the limit.
+
+Denial remains worthless at every setting, with the planner on or off. Beyond
+the rarity above, there is a strategic reason to expect this in a four-player
+game: blocking one opponent helps the other two as much as it helps you, so it
+is a private cost paid for a public good.
+
+## Where strategies gain ground: phase snapshots
+
+Aggregate win rates hide *when* a strategy works. Every player's position is
+recorded at three boundaries — the end of setup, and the first moments the
+leader reaches 40% and 70% of the target — so the game splits into early, mid
+and late. Boundaries are set by the leader's score rather than by turn number,
+because game lengths vary: "two thirds done" is a statement about how close
+someone is to winning, not about elapsed turns. Rates are per *own* turn, so a
+strategy is not penalised for short games. The setup baseline matters: without
+it the early phase starts from zero and credits everyone with the two points
+their opening settlements simply came with.
+
+What it shows (30k games, `tuned`/`city_builder`/`dev_rush`/`expander`):
+
+| strategy | phase | VP/turn | cards/turn | pips | lead% | win if leading |
+|---|---|---|---|---|---|---|
+| tuned | early | 0.170 | 3.14 | 24.4 | 24% | **51%** |
+| | mid | 0.301 | 4.15 | 35.6 | 27% | **69%** |
+| | late | **0.384** | 5.70 | 51.2 | | |
+| city_builder | early | 0.167 | 2.81 | 24.6 | 23% | 40% |
+| | mid | 0.279 | 3.97 | 35.9 | 21% | 61% |
+| | late | 0.337 | 5.50 | 49.2 | | |
+| dev_rush | early | 0.160 | 2.90 | 20.7 | 25% | 31% |
+| | mid | **0.313** | 3.50 | 24.4 | 26% | 48% |
+| | late | 0.262 | 4.25 | 33.3 | | |
+| expander | early | **0.179** | 2.87 | 23.9 | **27%** | **25%** |
+| | mid | 0.301 | 3.42 | 32.3 | 25% | 45% |
+| | late | 0.250 | 4.81 | 46.1 | | |
+
+Three things the aggregate numbers could not show:
+
+- **The early game is nearly symmetric.** Every strategy scores between 0.160
+  and 0.179 VP per turn and leads in 23-27% of games. Nothing is decided there.
+- **The ranking inverts between phases.** `dev_rush` has the *best* mid-game
+  rate (0.313) and the *worst* late one (0.262); `tuned` and `city_builder`
+  accelerate instead. `expander` leads most often early (27%) and converts
+  worst of all.
+- **Closing, not leading, is what separates them.** `expander` and `tuned`
+  reach the end of the early phase in front about equally often, but `expander`
+  goes on to win a quarter of those games and `tuned` half. That 2:1 gap in
+  conversion, not any difference in getting ahead, is where the win rate comes
+  from.
+
+The breakdown also dates the cost of refusing to trade. `hermit` is identical
+to `balanced` except that it never trades, and its deficit compounds:
+**-18%** VP per turn in the early phase, **-23%** in the mid, **-31%** in the
+late. Without trading you end up sitting on resources you cannot use, and that
+bites hardest once cities need specific cards.
+
 ## Valuing opening positions in pips
 
 ```bash

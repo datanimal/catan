@@ -322,6 +322,8 @@ pub struct Summary {
     /// Win rate by how many distinct resources the opening covers.
     pub opening_breadth: Vec<Bucket>,
     pub roll_histogram: [u32; 13],
+    /// Per-strategy performance split into early, mid and late game.
+    pub phases: Vec<PhaseStats>,
 }
 
 fn bucketize(
@@ -513,6 +515,7 @@ pub fn summarize(records: &[GameRecord]) -> Summary {
         opening_pips,
         opening_breadth,
         roll_histogram: hist,
+        phases: phase_breakdown(records),
     }
 }
 
@@ -677,4 +680,123 @@ pub fn ols(names: &[String], x: &[Vec<f64>], y: &[f64]) -> Option<Ols> {
             .map(|i| (0..k).map(|j| s2 * inv[i][j]).collect())
             .collect(),
     })
+}
+
+// ---------------------------------------------------------------- phases ----
+
+/// How a strategy performed within one phase of the game.
+///
+/// Rates are per *own turn*, not per game turn, so a strategy is not
+/// penalised for games that ended quickly. Phases are bounded by the leader's
+/// score (see `PhaseSnapshot`), so "early" means the same stage of the race in
+/// every game regardless of its length.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhaseStats {
+    pub name: String,
+    pub phase: String,
+    pub games: usize,
+    /// Victory points gained per own turn during the phase.
+    pub vp_per_turn: f64,
+    /// Cards taken in per own turn during the phase.
+    pub cards_per_turn: f64,
+    /// Mean engine size (pips) at the end of the phase.
+    pub pips_end: f64,
+    /// Mean victory points at the end of the phase.
+    pub vp_end: f64,
+    /// Share of games level with the lead at the end of the phase.
+    pub lead_rate: f64,
+    /// Win rate among games where they led at the end of the phase.
+    pub win_if_leading: f64,
+    /// Win rate among games where they did not.
+    pub win_if_behind: f64,
+    /// Mean own turns taken during the phase.
+    pub turns: f64,
+}
+
+/// Per-strategy, per-phase breakdown. Returns rows ordered by strategy then
+/// phase (early, mid, late).
+pub fn phase_breakdown(records: &[GameRecord]) -> Vec<PhaseStats> {
+    let mut by_name: BTreeMap<&str, Vec<&PlayerResult>> = BTreeMap::new();
+    for g in records {
+        for p in &g.players {
+            // Setup baseline plus both boundaries are needed for three phases.
+            if p.metrics.snapshots.len() == 3 {
+                by_name.entry(p.policy.as_str()).or_default().push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (name, ps) in by_name {
+        for (phase, idx) in [("early", 0usize), ("mid", 1), ("late", 2)] {
+            // Position at the start and end of this phase. Phase 0 starts
+            // from nothing; phase 2 ends at the final metrics.
+            let mut vp_rate = Vec::new();
+            let mut card_rate = Vec::new();
+            let mut pips_end = Vec::new();
+            let mut vp_end = Vec::new();
+            let mut turns = Vec::new();
+            let mut leading = Vec::new();
+            let mut win_lead: Vec<f64> = Vec::new();
+            let mut win_behind: Vec<f64> = Vec::new();
+            for p in &ps {
+                let s = &p.metrics.snapshots;
+                // Phase `idx` runs from snapshot `idx` to snapshot `idx+1`,
+                // with the final metrics standing in for the last boundary.
+                let a = &s[idx];
+                let (t0, v0, c0) = (a.own_turns, a.vp, a.inflow);
+                let (t1, v1, c1, pe, lead) = if idx == 2 {
+                    (
+                        p.metrics.turns,
+                        p.vp,
+                        p.metrics.total_inflow(),
+                        p.metrics.final_pips,
+                        p.won,
+                    )
+                } else {
+                    let b = &s[idx + 1];
+                    (b.own_turns, b.vp, b.inflow, b.pips, b.leading)
+                };
+                let dt = (t1.saturating_sub(t0)) as f64;
+                if dt > 0.0 {
+                    vp_rate.push((v1 as f64 - v0 as f64) / dt);
+                    card_rate.push((c1 - c0) as f64 / dt);
+                    turns.push(dt);
+                }
+                pips_end.push(pe as f64);
+                vp_end.push(v1 as f64);
+                // Leading at the *end* of early or mid is the predictive
+                // quantity; for the final phase it is just winning.
+                if idx < 2 {
+                    leading.push(lead as u8 as f64);
+                    if lead {
+                        win_lead.push(p.won as u8 as f64);
+                    } else {
+                        win_behind.push(p.won as u8 as f64);
+                    }
+                }
+            }
+            out.push(PhaseStats {
+                name: name.to_string(),
+                phase: phase.to_string(),
+                games: ps.len(),
+                vp_per_turn: mean(&vp_rate),
+                cards_per_turn: mean(&card_rate),
+                pips_end: mean(&pips_end),
+                vp_end: mean(&vp_end),
+                lead_rate: if idx < 2 { mean(&leading) } else { f64::NAN },
+                win_if_leading: if win_lead.is_empty() {
+                    f64::NAN
+                } else {
+                    mean(&win_lead)
+                },
+                win_if_behind: if win_behind.is_empty() {
+                    f64::NAN
+                } else {
+                    mean(&win_behind)
+                },
+                turns: mean(&turns),
+            });
+        }
+    }
+    out
 }

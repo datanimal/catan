@@ -16,6 +16,54 @@ use crate::types::*;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Diagnostic counters for the planner. Cheap relaxed atomics, kept in the
+/// build so that "the feature made no difference" can always be told apart
+/// from "the feature never ran".
+pub static PLAN_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static PLAN_FOUND: AtomicU64 = AtomicU64::new(0);
+pub static PLAN_CHOSEN: AtomicU64 = AtomicU64::new(0);
+pub static PLAN_FLIPPED: AtomicU64 = AtomicU64::new(0);
+/// Decisions where a settlement was affordable at all -- the precondition for
+/// any plan. Separates "my feasibility test is too strict" from "the
+/// situation genuinely does not arise".
+pub static PLAN_AFFORDABLE: AtomicU64 = AtomicU64::new(0);
+/// Of those, decisions where some reachable spot was strictly better than
+/// anything already in reach.
+pub static PLAN_BETTER_EXISTS: AtomicU64 = AtomicU64::new(0);
+/// Plans that are only affordable because a Road Building card pays for part
+/// of the route -- the card dodges the hand limit by supplying roads free.
+pub static PLAN_VIA_RB: AtomicU64 = AtomicU64::new(0);
+
+pub fn plan_counters() -> (u64, u64, u64, u64) {
+    (
+        PLAN_CALLS.load(Ordering::Relaxed),
+        PLAN_FOUND.load(Ordering::Relaxed),
+        PLAN_CHOSEN.load(Ordering::Relaxed),
+        PLAN_FLIPPED.load(Ordering::Relaxed),
+    )
+}
+pub fn plan_preconditions() -> (u64, u64, u64) {
+    (
+        PLAN_AFFORDABLE.load(Ordering::Relaxed),
+        PLAN_BETTER_EXISTS.load(Ordering::Relaxed),
+        PLAN_VIA_RB.load(Ordering::Relaxed),
+    )
+}
+pub fn reset_plan_counters() {
+    for c in [
+        &PLAN_CALLS,
+        &PLAN_FOUND,
+        &PLAN_CHOSEN,
+        &PLAN_FLIPPED,
+        &PLAN_AFFORDABLE,
+        &PLAN_BETTER_EXISTS,
+        &PLAN_VIA_RB,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Weights {
@@ -63,6 +111,9 @@ pub struct Weights {
     /// Value of denying opponents the intersections a new settlement shuts
     /// out under the distance rule.
     pub block_drive: f64,
+    /// Weight on the sequential plan: how strongly to pursue a settlement
+    /// several roads away that is better than anything already in reach.
+    pub plan_drive: f64,
     /// Random jitter added to every score, to break ties and decorrelate.
     pub noise: f64,
     /// Place the opening settlements uniformly at random among the legal
@@ -74,7 +125,7 @@ pub struct Weights {
 }
 
 /// The tunable parameters, as a flat list for search.
-pub const PARAM_KEYS: [&str; 22] = [
+pub const PARAM_KEYS: [&str; 23] = [
     "w_city",
     "w_settlement",
     "w_road",
@@ -97,6 +148,7 @@ pub const PARAM_KEYS: [&str; 22] = [
     "road_horizon_base",
     "contest_drive",
     "block_drive",
+    "plan_drive",
 ];
 
 /// Plausible bounds for each parameter, so a search cannot wander into
@@ -121,6 +173,7 @@ pub fn param_bounds(key: &str) -> (f64, f64) {
         "road_horizon_base" => (1.0, 6.0),
         "contest_drive" => (0.0, 4.0),
         "block_drive" => (0.0, 4.0),
+        "plan_drive" => (0.0, 4.0),
         _ => (0.0, 1.0),
     }
 }
@@ -151,6 +204,7 @@ impl Weights {
             "road_horizon_base" => self.road_horizon_base,
             "contest_drive" => self.contest_drive,
             "block_drive" => self.block_drive,
+            "plan_drive" => self.plan_drive,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -182,6 +236,7 @@ impl Weights {
             "road_horizon_base" => self.road_horizon_base = v,
             "contest_drive" => self.contest_drive = v,
             "block_drive" => self.block_drive = v,
+            "plan_drive" => self.plan_drive = v,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -252,6 +307,7 @@ impl Default for Weights {
             // setting, so it is off by default; the hook is kept because the
             // null may be an artefact of having no lookahead.
             block_drive: 0.0,
+            plan_drive: 1.0,
             noise: 0.75,
             random_opening: false,
         }
@@ -398,6 +454,33 @@ impl Policy for RandomBot {
 
 // ------------------------------------------------------------- heuristic ----
 
+/// A settlement that can be acquired within this turn's means, together with
+/// the sequence of actions that gets there.
+///
+/// This is the bounded sequential lookahead. Scoring single actions greedily
+/// cannot represent "play Road Building, lay two roads, settle the good spot",
+/// because each step on its own looks worse than simply settling whatever is
+/// already in reach. The planner evaluates the whole package against that
+/// alternative, which is also what finally gives denial something to do: the
+/// bot can now travel to a spot *in order to* shut an opponent out, instead of
+/// only preferring denial among spots it was already going to take.
+#[derive(Clone, Debug)]
+struct Plan {
+    target: u8,
+    /// Edges to build, nearest first.
+    route: Vec<u8>,
+    /// Whether the plan spends a Road Building card to afford the route.
+    needs_road_building: bool,
+    /// Score of the finished position on the *settlement* scale, net of the
+    /// resources the route costs. Comparable with `BuildSettlement`, which is
+    /// the alternative it has to beat.
+    score: f64,
+    #[allow(dead_code)]
+    target_kept_for_debug: (),
+    /// How much it beats settling the best spot already in reach.
+    excess: f64,
+}
+
 /// Per-decision road geography, computed once per `choose` rather than once
 /// per action, since it is the same for every candidate move.
 struct RoadCtx {
@@ -411,6 +494,12 @@ struct RoadCtx {
     reach: [f64; N_NODES],
     /// The same, with two extra roads available -- what Road Building unlocks.
     reach_rb: [f64; N_NODES],
+    /// The edge each intersection was first reached by, for route building.
+    /// Consumed when the plan is built, then kept for debugging.
+    #[allow(dead_code)]
+    my_via: [u8; N_NODES],
+    /// The best settlement plan executable this turn, if any.
+    plan: Option<Plan>,
     /// How many roads ahead the reach values look. Kept for debugging and
     /// for the `horizon` assertions in tests.
     #[allow(dead_code)]
@@ -423,6 +512,8 @@ impl Default for RoadCtx {
         RoadCtx {
             my_dist: [u8::MAX; N_NODES],
             opp_dist: [u8::MAX; N_NODES],
+            my_via: [u8::MAX; N_NODES],
+            plan: None,
             reach: [0.0; N_NODES],
             reach_rb: [0.0; N_NODES],
             horizon: 2,
@@ -436,12 +527,15 @@ pub struct HeuristicBot {
     ctx: RoadCtx,
 }
 
-/// Roads needed for `p` to reach each intersection. A path may not pass
-/// through an intersection occupied by an opponent, and `p`'s existing roads
-/// are free to travel along.
-fn road_distances(v: &View, p: u8) -> [u8; N_NODES] {
+/// Roads needed for `p` to reach each intersection, and the edge each
+/// intersection was first reached by, so a route can be reconstructed.
+///
+/// A path may not pass through an intersection occupied by an opponent, and
+/// `p`'s existing roads are free to travel along.
+fn road_distances_with_paths(v: &View, p: u8) -> ([u8; N_NODES], [u8; N_NODES]) {
     let topo = crate::board::topology();
     let mut dist = [u8::MAX; N_NODES];
+    let mut via = [u8::MAX; N_NODES];
     let mut dq: std::collections::VecDeque<u8> = Default::default();
     // Sources: anywhere p already has a presence.
     for n in 0..N_NODES as u8 {
@@ -476,6 +570,7 @@ fn road_distances(v: &View, p: u8) -> [u8; N_NODES] {
             let nd = d.saturating_add(step);
             if nd < dist[m as usize] {
                 dist[m as usize] = nd;
+                via[m as usize] = e;
                 if step == 0 {
                     dq.push_front(m);
                 } else {
@@ -484,7 +579,45 @@ fn road_distances(v: &View, p: u8) -> [u8; N_NODES] {
             }
         }
     }
-    dist
+    (dist, via)
+}
+
+/// Distances only, for callers that do not need routes.
+fn road_distances(v: &View, p: u8) -> [u8; N_NODES] {
+    road_distances_with_paths(v, p).0
+}
+
+/// The edges that must be built, nearest first, to reach `target`.
+fn route_to(
+    v: &View,
+    target: u8,
+    dist: &[u8; N_NODES],
+    via: &[u8; N_NODES],
+) -> Vec<u8> {
+    let topo = crate::board::topology();
+    let mut out = Vec::new();
+    let mut n = target;
+    // Walk back to the player's existing network.
+    while dist[n as usize] > 0 {
+        let e = via[n as usize];
+        if e == u8::MAX {
+            return Vec::new();
+        }
+        if v.edge(e).is_none() {
+            out.push(e);
+        }
+        let [a, b] = topo.edge_nodes[e as usize];
+        let prev = if a == n { b } else { a };
+        if dist[prev as usize] >= dist[n as usize] && v.edge(e).is_none() {
+            return Vec::new(); // not making progress; bail out
+        }
+        n = prev;
+        if out.len() > 10 {
+            return Vec::new();
+        }
+    }
+    out.reverse();
+    out
 }
 
 impl HeuristicBot {
@@ -520,11 +653,136 @@ impl HeuristicBot {
         h.min(v.roads_left()).min(7).max(1)
     }
 
+    /// Enumerate settlement targets reachable this turn and keep the best.
+    ///
+    /// A target `d` roads away needs `d` roads and a settlement. Free roads
+    /// already granted pay for some; a Road Building card still in hand pays
+    /// for two more. The rest must be affordable in cash.
+    fn plan_settlement(
+        &self,
+        v: &View,
+        my_dist: &[u8; N_NODES],
+        my_via: &[u8; N_NODES],
+    ) -> Option<Plan> {
+        if v.settlements_left() == 0 {
+            return None;
+        }
+        let hand = *v.hand();
+        let free_now = v.free_roads();
+        let rb_in_hand = !v.dev_played_this_turn()
+            && v.my_dev()[DevCard::RoadBuilding.idx()] > 0
+            && free_now == 0;
+
+        // Everything is scored the way `BuildSettlement` is scored, because
+        // that is the action a plan competes against. Scoring the plan's first
+        // step on the *road* scale instead was the original mistake: a road
+        // scores around 16 and settling a mediocre spot now around 75, so no
+        // plan bonus of a plausible size could ever win.
+        let settle_score = |n: u8| {
+            self.w.w_settlement + 1.3 * self.node_value(v, n) + self.block_value(v, n)
+        };
+        // Each road the route cannot get for free costs a brick and a lumber.
+        // Charging it here is what makes Road Building pivotal: it supplies
+        // two roads at no cost, so it removes two of these penalties.
+        const CARD_VALUE: f64 = 8.0;
+        let road_penalty = 2.0 * CARD_VALUE;
+
+        let mut best_immediate = 0.0f64;
+        if can_afford(&hand, &COST_SETTLEMENT) {
+            for n in 0..N_NODES as u8 {
+                if my_dist[n as usize] == 0 && v.node_open(n) {
+                    best_immediate = best_immediate.max(settle_score(n));
+                }
+            }
+            PLAN_AFFORDABLE.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut any_better = false;
+        let mut best: Option<Plan> = None;
+        for t in 0..N_NODES as u8 {
+            let d = my_dist[t as usize];
+            if d == u8::MAX || d == 0 || !v.node_open(t) {
+                continue;
+            }
+            if d > v.roads_left() || d > 4 {
+                continue;
+            }
+            // Roads the free ones and a Road Building card do not cover.
+            let covered_free = free_now.min(d);
+            let mut remaining = d - covered_free;
+            let mut needs_rb = false;
+            if remaining > 0 && rb_in_hand {
+                remaining -= remaining.min(2);
+                needs_rb = true;
+            }
+            let score = settle_score(t) - road_penalty * remaining as f64;
+            if score > best_immediate {
+                any_better = true;
+            }
+
+            let mut cost = COST_SETTLEMENT;
+            for _ in 0..remaining {
+                res_add(&mut cost, &COST_ROAD);
+            }
+            if !can_afford(&hand, &cost) {
+                continue;
+            }
+            let route = route_to(v, t, my_dist, my_via);
+            if route.is_empty() || route.len() != d as usize {
+                continue;
+            }
+            let excess = score - best_immediate;
+            if excess <= 0.0 {
+                continue;
+            }
+            if best.as_ref().map(|b| excess > b.excess).unwrap_or(true) {
+                if needs_rb {
+                    PLAN_VIA_RB.fetch_add(1, Ordering::Relaxed);
+                }
+                best = Some(Plan {
+                    target: t,
+                    route,
+                    needs_road_building: needs_rb,
+                    score,
+                    target_kept_for_debug: (),
+                    excess,
+                });
+            }
+        }
+        if any_better {
+            PLAN_BETTER_EXISTS.fetch_add(1, Ordering::Relaxed);
+        }
+        best
+    }
+
+    /// Lift the first step of the best plan onto the plan's own score.
+    ///
+    /// At `plan_drive` 1 the step scores exactly what the finished plan is
+    /// worth, so it competes with settling now on equal terms; at 0 it keeps
+    /// its ordinary greedy score.
+    fn plan_bonus(&self, v: &View, a: &Action, greedy: f64) -> f64 {
+        let Some(p) = &self.ctx.plan else {
+            return 0.0;
+        };
+        let first_matches = match *a {
+            Action::PlayRoadBuilding => p.needs_road_building,
+            Action::BuildRoad(e) => !p.needs_road_building && p.route.first() == Some(&e),
+            Action::BuildSettlement(n) => n == p.target && p.route.is_empty(),
+            _ => false,
+        };
+        let _ = v;
+        if first_matches {
+            self.w.plan_drive * (p.score - greedy).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
     /// Build the per-decision road geography.
     fn build_ctx(&mut self, v: &View) {
         let topo = crate::board::topology();
         let me = v.me();
-        let my_dist = road_distances(v, me);
+        let (my_dist, my_via) = road_distances_with_paths(v, me);
         let mut opp_dist = [u8::MAX; N_NODES];
         for q in 0..v.n_players() as u8 {
             if q == me {
@@ -585,8 +843,15 @@ impl HeuristicBot {
             }
             val
         };
+        let plan = self.plan_settlement(v, &my_dist, &my_via);
+        PLAN_CALLS.fetch_add(1, Ordering::Relaxed);
+        if plan.is_some() {
+            PLAN_FOUND.fetch_add(1, Ordering::Relaxed);
+        }
         self.ctx = RoadCtx {
             my_dist,
+            my_via,
+            plan,
             opp_dist,
             reach: relax(horizon.saturating_sub(1), &seed),
             // Exactly two extra roads: the counterfactual horizon if the Road
@@ -887,7 +1152,8 @@ impl HeuristicBot {
         total
     }
 
-    fn score(&mut self, v: &View, a: &Action) -> f64 {
+    /// Greedy single-action score, without the plan bonus or jitter.
+    fn score_base(&mut self, v: &View, a: &Action) -> f64 {
         let hand = *v.hand();
         let target = self.target_cost(v);
         let def_now = Self::deficit(&hand, &target);
@@ -1026,7 +1292,16 @@ impl HeuristicBot {
             Action::MoveRobber { hex, victim } => 50.0 + self.robber_score(v, hex, victim),
         };
 
-        base + self.rng.random_range(0.0..1.0) * self.w.noise
+        base
+    }
+
+    /// Full score: greedy value, lifted onto the plan's scale if this action
+    /// starts the plan, plus tie-breaking jitter.
+    fn score(&mut self, v: &View, a: &Action) -> (f64, f64) {
+        let base = self.score_base(v, a);
+        let bonus = self.plan_bonus(v, a, base);
+        let jitter = self.rng.random_range(0.0..1.0) * self.w.noise;
+        (base + bonus + jitter, bonus)
     }
 }
 
@@ -1073,13 +1348,30 @@ impl Policy for HeuristicBot {
         }) {
             self.build_ctx(v);
         }
+        // Score once with the plan bonus and once without, so it is visible
+        // whether the plan actually changed the decision.
         let mut best = 0usize;
         let mut best_s = f64::MIN;
+        let mut best_noplan = 0usize;
+        let mut best_s_noplan = f64::MIN;
+        let mut best_bonus = 0.0f64;
         for (i, a) in actions.iter().enumerate() {
-            let s = self.score(v, a);
+            let (s, bonus) = self.score(v, a);
             if s > best_s {
                 best_s = s;
                 best = i;
+                best_bonus = bonus;
+            }
+            let sn = s - bonus;
+            if sn > best_s_noplan {
+                best_s_noplan = sn;
+                best_noplan = i;
+            }
+        }
+        if self.ctx.plan.is_some() && best_bonus > 0.0 {
+            PLAN_CHOSEN.fetch_add(1, Ordering::Relaxed);
+            if best != best_noplan {
+                PLAN_FLIPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
         best

@@ -97,6 +97,8 @@ pub struct PlayerMetrics {
     pub opening: OpeningFeatures,
     /// Port access at the end of the game, as a bitmask (see `PlayerState`).
     pub final_port_mask: u8,
+    /// Position at each phase boundary, in order.
+    pub snapshots: Vec<PhaseSnapshot>,
 
     // ---- outcome ----
     pub vp_final: u8,
@@ -194,6 +196,35 @@ impl PlayerMetrics {
             self.last_vp_recorded = vp;
         }
     }
+}
+
+/// A player's position at a phase boundary.
+///
+/// Phases are marked by the *leader's* score rather than by turn number,
+/// because game lengths vary: "the game is two thirds done" is a statement
+/// about how close someone is to winning, not about how many turns have
+/// passed. Early ends when the leader first reaches 40% of the target, mid
+/// when they reach 70%, and late runs to the end.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PhaseSnapshot {
+    /// 0 = end of early, 1 = end of mid.
+    pub marker: u8,
+    /// Turns elapsed in the game as a whole.
+    pub game_turn: u32,
+    /// Turns this player has taken.
+    pub own_turns: u32,
+    pub vp: u8,
+    /// Every card taken in so far.
+    pub inflow: i32,
+    /// Engine size: pips of their buildings.
+    pub pips: u32,
+    pub settlements: u8,
+    pub cities: u8,
+    pub roads: u8,
+    pub dev_bought: u32,
+    pub knights: u8,
+    /// True if this player was level with the best score at the boundary.
+    pub leading: bool,
 }
 
 /// Measurable properties of an opening position.

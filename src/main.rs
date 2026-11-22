@@ -593,6 +593,8 @@ fn print_report(cfg: &SimConfig, s: &Summary, dt: std::time::Duration) {
     }
     println!("  gotT = offers of theirs that were accepted; gaveT = offers they accepted");
 
+    print_phases(s);
+
     println!("\n=== seat position ===");
     println!(
         "{:<6} {:>7} {:>7} {:>15} {:>7} {:>9}",
@@ -630,6 +632,51 @@ fn print_report(cfg: &SimConfig, s: &Summary, dt: std::time::Duration) {
         100.0 * worst.0,
         worst.1
     );
+}
+
+fn print_phases(s: &Summary) {
+    if s.phases.is_empty() {
+        return;
+    }
+    println!("\n=== where each strategy gains ground ===");
+    println!(
+        "phases are bounded by the leader's score, not by turn number: early ends when"
+    );
+    println!("someone first reaches 40% of the target, mid at 70%. Rates are per own turn.");
+    println!(
+        "\n{:<14} {:<7} {:>7} {:>9} {:>10} {:>8} {:>8} {:>8} {:>9}",
+        "strategy", "phase", "turns", "VP/turn", "cards/turn", "VP end", "pips", "lead%", "win|lead"
+    );
+    let mut names: Vec<&String> = s.phases.iter().map(|p| &p.name).collect();
+    names.dedup();
+    for n in names {
+        for p in s.phases.iter().filter(|p| &p.name == n) {
+            let lead = if p.lead_rate.is_nan() {
+                "   -".to_string()
+            } else {
+                format!("{:>3.0}%", 100.0 * p.lead_rate)
+            };
+            let wl = if p.win_if_leading.is_nan() {
+                "    -".to_string()
+            } else {
+                format!("{:>4.0}%", 100.0 * p.win_if_leading)
+            };
+            println!(
+                "{:<14} {:<7} {:>7.1} {:>9.3} {:>10.2} {:>8.2} {:>8.1} {:>8} {:>9}",
+                if p.phase == "early" { p.name.as_str() } else { "" },
+                p.phase,
+                p.turns,
+                p.vp_per_turn,
+                p.cards_per_turn,
+                p.vp_end,
+                p.pips_end,
+                lead,
+                wl
+            );
+        }
+    }
+    println!("  lead% = share of games level with the best score at the end of that phase");
+    println!("  win|lead = win rate in those games, i.e. how well a lead converts");
 }
 
 fn print_buckets(title: &str, bs: &[analysis::Bucket]) {

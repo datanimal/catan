@@ -62,6 +62,9 @@ pub struct Game {
     seed: u64,
     roll_hist: [u32; 13],
     dice_deck: Vec<u8>,
+    /// Whether each phase boundary has been recorded yet. Index 0 is the end
+    /// of setup, which is the baseline the early phase is measured from.
+    snapped: [bool; 3],
 }
 
 impl Game {
@@ -89,6 +92,7 @@ impl Game {
             seed,
             roll_hist: [0; 13],
             dice_deck: Vec::new(),
+            snapped: [false; 3],
         }
     }
 
@@ -388,6 +392,56 @@ impl Game {
         }
 
         self.check_win(p);
+        self.maybe_snapshot();
+    }
+
+    /// Record every player's position the first time the leader crosses each
+    /// phase boundary.
+    fn maybe_snapshot(&mut self) {
+        let target = self.st.vp_target as f64;
+        let leader_vp = (0..self.st.n_players() as u8)
+            .map(|p| self.st.vp(p))
+            .max()
+            .unwrap_or(0);
+        // Marker 0 is the end of setup, recorded by `advance_setup`. Without
+        // it the early phase would start from zero and so credit every player
+        // with the two victory points their opening settlements simply came
+        // with, inflating the early rate for everyone.
+        let thresholds = [
+            0u8,
+            (target * 0.4).ceil() as u8,
+            (target * 0.7).ceil() as u8,
+        ];
+        for marker in 1..3usize {
+            if self.snapped[marker] || leader_vp < thresholds[marker] {
+                continue;
+            }
+            self.snapped[marker] = true;
+            self.record_snapshot(marker as u8, leader_vp);
+        }
+    }
+
+    fn record_snapshot(&mut self, marker: u8, leader_vp: u8) {
+            for q in 0..self.st.n_players() {
+                let qp = q as u8;
+                let vp = self.st.vp(qp);
+                let pips = self.st.raw_pips(qp);
+                let snap = crate::metrics::PhaseSnapshot {
+                    marker,
+                    game_turn: self.st.turn,
+                    own_turns: self.st.players[q].metrics.turns,
+                    vp,
+                    inflow: self.st.players[q].metrics.total_inflow(),
+                    pips,
+                    settlements: self.st.players[q].metrics.settlements_built as u8,
+                    cities: self.st.players[q].metrics.cities_built as u8,
+                    roads: self.st.players[q].metrics.roads_built as u8,
+                    dev_bought: self.st.players[q].metrics.dev_bought,
+                    knights: self.st.players[q].knights_played,
+                    leading: vp == leader_vp,
+                };
+                self.st.players[q].metrics.snapshots.push(snap);
+            }
     }
 
     // ------------------------------------------------------------ helpers --
@@ -498,6 +552,16 @@ impl Game {
             self.st.current = 0;
             self.st.turn = 1;
             self.st.update_longest_road();
+            // Baseline for the early phase: everyone's position once the
+            // opening settlements are down and before any die is rolled.
+            if !self.snapped[0] {
+                self.snapped[0] = true;
+                let lv = (0..self.st.n_players() as u8)
+                    .map(|p| self.st.vp(p))
+                    .max()
+                    .unwrap_or(0);
+                self.record_snapshot(0, lv);
+            }
             self.note_turn_start();
         }
     }
