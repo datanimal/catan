@@ -45,6 +45,24 @@ pub struct Weights {
     pub accepts_trades: bool,
     /// Reluctance to hand resources to the player in the lead.
     pub leader_wariness: f64,
+    /// Weight on the timing premium for playing a knight *before* rolling:
+    /// the expected cards it adds to this turn's roll by freeing one of my
+    /// hexes, plus the cards it denies an opponent on the same roll.
+    pub knight_timing: f64,
+    /// Value discount per extra road needed to reach a spot. Together with
+    /// the road budget this sets the planning horizon, so holding Road
+    /// Building genuinely extends how far the bot can see.
+    pub reach_decay: f64,
+    /// Baseline planning horizon in roads, before any bonus for free roads,
+    /// a Road Building card or spare brick and lumber. Roads persist, so this
+    /// is how far ahead the bot looks as a matter of course.
+    pub road_horizon_base: f64,
+    /// Urgency multiplier for a spot an opponent could reach as soon as I
+    /// could -- racing them to it.
+    pub contest_drive: f64,
+    /// Value of denying opponents the intersections a new settlement shuts
+    /// out under the distance rule.
+    pub block_drive: f64,
     /// Random jitter added to every score, to break ties and decorrelate.
     pub noise: f64,
     /// Place the opening settlements uniformly at random among the legal
@@ -56,7 +74,7 @@ pub struct Weights {
 }
 
 /// The tunable parameters, as a flat list for search.
-pub const PARAM_KEYS: [&str; 17] = [
+pub const PARAM_KEYS: [&str; 22] = [
     "w_city",
     "w_settlement",
     "w_road",
@@ -74,6 +92,11 @@ pub const PARAM_KEYS: [&str; 17] = [
     "propose_drive",
     "accept_floor",
     "leader_wariness",
+    "knight_timing",
+    "reach_decay",
+    "road_horizon_base",
+    "contest_drive",
+    "block_drive",
 ];
 
 /// Plausible bounds for each parameter, so a search cannot wander into
@@ -91,6 +114,13 @@ pub fn param_bounds(key: &str) -> (f64, f64) {
         "bank_trade_drive" | "propose_drive" => (0.0, 6.0),
         "accept_floor" => (-3.0, 4.0),
         "leader_wariness" => (0.0, 10.0),
+        "knight_timing" => (0.0, 60.0),
+        // Below about 0.2 a road is valued only for the spot it reaches
+        // directly; near 0.9 distant spots count almost as much as near ones.
+        "reach_decay" => (0.15, 0.95),
+        "road_horizon_base" => (1.0, 6.0),
+        "contest_drive" => (0.0, 4.0),
+        "block_drive" => (0.0, 4.0),
         _ => (0.0, 1.0),
     }
 }
@@ -116,6 +146,11 @@ impl Weights {
             "propose_drive" => self.propose_drive,
             "accept_floor" => self.accept_floor,
             "leader_wariness" => self.leader_wariness,
+            "knight_timing" => self.knight_timing,
+            "reach_decay" => self.reach_decay,
+            "road_horizon_base" => self.road_horizon_base,
+            "contest_drive" => self.contest_drive,
+            "block_drive" => self.block_drive,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -142,6 +177,11 @@ impl Weights {
             "propose_drive" => self.propose_drive = v,
             "accept_floor" => self.accept_floor = v,
             "leader_wariness" => self.leader_wariness = v,
+            "knight_timing" => self.knight_timing = v,
+            "reach_decay" => self.reach_decay = v,
+            "road_horizon_base" => self.road_horizon_base = v,
+            "contest_drive" => self.contest_drive = v,
+            "block_drive" => self.block_drive = v,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -202,6 +242,16 @@ impl Default for Weights {
             accept_floor: 0.5,
             accepts_trades: true,
             leader_wariness: 3.0,
+            // All four set from the parameter sweeps in the README.
+            knight_timing: 15.0,
+            reach_decay: 0.8,
+            // Looking further than two roads ahead measured flat from 2 to 6.
+            road_horizon_base: 2.0,
+            contest_drive: 1.5,
+            // Denying opponents spots showed no measurable value at any
+            // setting, so it is off by default; the hook is kept because the
+            // null may be an artefact of having no lookahead.
+            block_drive: 0.0,
             noise: 0.75,
             random_opening: false,
         }
@@ -240,6 +290,10 @@ impl Weights {
                 w.propose_drive = 2.248;
                 w.accept_floor = 0.279;
                 w.leader_wariness = 3.835;
+                w.knight_timing = 15.0;
+                w.reach_decay = 0.8;
+                w.contest_drive = 1.5;
+                w.block_drive = 0.0;
             }
             // Ore and grain, straight to cities. Few roads.
             "city_builder" => {
@@ -344,9 +398,93 @@ impl Policy for RandomBot {
 
 // ------------------------------------------------------------- heuristic ----
 
+/// Per-decision road geography, computed once per `choose` rather than once
+/// per action, since it is the same for every candidate move.
+struct RoadCtx {
+    /// Roads I would need to lay to reach each intersection.
+    my_dist: [u8; N_NODES],
+    /// Roads the nearest opponent would need. Used to spot contested spots.
+    opp_dist: [u8; N_NODES],
+    /// Best discounted value obtainable starting from each intersection,
+    /// propagated back along buildable paths. This is what gives the bot a
+    /// planning horizon longer than one road.
+    reach: [f64; N_NODES],
+    /// The same, with two extra roads available -- what Road Building unlocks.
+    reach_rb: [f64; N_NODES],
+    /// How many roads ahead the reach values look. Kept for debugging and
+    /// for the `horizon` assertions in tests.
+    #[allow(dead_code)]
+    horizon: u8,
+}
+
+// Arrays this long have no derived Default.
+impl Default for RoadCtx {
+    fn default() -> Self {
+        RoadCtx {
+            my_dist: [u8::MAX; N_NODES],
+            opp_dist: [u8::MAX; N_NODES],
+            reach: [0.0; N_NODES],
+            reach_rb: [0.0; N_NODES],
+            horizon: 2,
+        }
+    }
+}
+
 pub struct HeuristicBot {
     w: Weights,
     rng: ChaCha8Rng,
+    ctx: RoadCtx,
+}
+
+/// Roads needed for `p` to reach each intersection. A path may not pass
+/// through an intersection occupied by an opponent, and `p`'s existing roads
+/// are free to travel along.
+fn road_distances(v: &View, p: u8) -> [u8; N_NODES] {
+    let topo = crate::board::topology();
+    let mut dist = [u8::MAX; N_NODES];
+    let mut dq: std::collections::VecDeque<u8> = Default::default();
+    // Sources: anywhere p already has a presence.
+    for n in 0..N_NODES as u8 {
+        let mine_here = v.node(n).map(|pc| pc.owner == p).unwrap_or(false)
+            || topo.node_edges[n as usize]
+                .iter()
+                .any(|&e| v.edge(e) == Some(p));
+        if mine_here {
+            dist[n as usize] = 0;
+            dq.push_back(n);
+        }
+    }
+    // 0-1 BFS: travelling an existing road of mine costs nothing, laying a
+    // new one costs one.
+    while let Some(n) = dq.pop_front() {
+        // Cannot build out through an opponent's settlement or city.
+        if let Some(pc) = v.node(n) {
+            if pc.owner != p {
+                continue;
+            }
+        }
+        let d = dist[n as usize];
+        for &e in topo.node_edges[n as usize].iter() {
+            let owner = v.edge(e);
+            let step = match owner {
+                Some(o) if o == p => 0u8,
+                Some(_) => continue, // an opponent's road blocks this path
+                None => 1,
+            };
+            let [a, b] = topo.edge_nodes[e as usize];
+            let m = if a == n { b } else { a };
+            let nd = d.saturating_add(step);
+            if nd < dist[m as usize] {
+                dist[m as usize] = nd;
+                if step == 0 {
+                    dq.push_front(m);
+                } else {
+                    dq.push_back(m);
+                }
+            }
+        }
+    }
+    dist
 }
 
 impl HeuristicBot {
@@ -354,7 +492,108 @@ impl HeuristicBot {
         HeuristicBot {
             w,
             rng: ChaCha8Rng::seed_from_u64(seed),
+            ctx: RoadCtx::default(),
         }
+    }
+
+    /// How far ahead to look along buildable paths.
+    ///
+    /// Roads persist, so there is always a reason to look a little beyond the
+    /// next settlement -- hence a baseline of two. What extends the horizon is
+    /// being able to lay several roads soon: free roads already granted, a
+    /// Road Building card still in hand, and brick and lumber to spare. That
+    /// is what lets the bot spot a spot three or four roads out that it could
+    /// reach in one turn, to race for or to shut off.
+    /// This does **not** include a bonus for holding an unplayed Road
+    /// Building card. That bonus belongs only to the counterfactual horizon
+    /// used to price the card itself: if it were folded in here, the "what
+    /// would two more roads buy me" comparison would measure two roads beyond
+    /// an already-extended horizon, which is close to nothing, and the card's
+    /// vision value would silently evaluate to zero.
+    fn road_horizon(&self, v: &View) -> u8 {
+        let mut h = self.w.road_horizon_base.round().max(1.0) as u8;
+        // Roads already granted by a played Road Building card count here.
+        h += v.free_roads();
+        let hand = v.hand();
+        let affordable = hand[Resource::Brick.idx()].min(hand[Resource::Lumber.idx()]);
+        h += (affordable.max(0) as u8).min(2);
+        h.min(v.roads_left()).min(7).max(1)
+    }
+
+    /// Build the per-decision road geography.
+    fn build_ctx(&mut self, v: &View) {
+        let topo = crate::board::topology();
+        let me = v.me();
+        let my_dist = road_distances(v, me);
+        let mut opp_dist = [u8::MAX; N_NODES];
+        for q in 0..v.n_players() as u8 {
+            if q == me {
+                continue;
+            }
+            let d = road_distances(v, q);
+            for i in 0..N_NODES {
+                opp_dist[i] = opp_dist[i].min(d[i]);
+            }
+        }
+
+        // Seed every open intersection with its value, raised when an
+        // opponent could get there as soon as I could.
+        let mut seed = [0.0f64; N_NODES];
+        for n in 0..N_NODES as u8 {
+            if !v.node_open(n) {
+                continue;
+            }
+            let base = self.node_value(v, n);
+            let (mine, theirs) = (my_dist[n as usize], opp_dist[n as usize]);
+            let urgency = if theirs <= mine {
+                1.0
+            } else if theirs == mine.saturating_add(1) {
+                0.5
+            } else {
+                0.0
+            };
+            seed[n as usize] = base * (1.0 + self.w.contest_drive * urgency);
+        }
+
+        // Propagate value backwards along buildable paths, one road per pass,
+        // discounting each step. `budget` passes means the bot sees exactly as
+        // far as it could actually build this turn.
+        let horizon = self.road_horizon(v);
+        let relax = |passes: u8, seed: &[f64; N_NODES]| -> [f64; N_NODES] {
+            let mut val = *seed;
+            for _ in 0..passes {
+                let mut next = val;
+                for e in 0..N_EDGES as u8 {
+                    if v.edge(e).is_some() {
+                        continue;
+                    }
+                    let [a, b] = topo.edge_nodes[e as usize];
+                    // Value cannot flow through an opponent's building.
+                    let passable = |n: u8| {
+                        v.node(n).map(|pc| pc.owner == v.me()).unwrap_or(true)
+                    };
+                    if passable(a) {
+                        next[a as usize] =
+                            next[a as usize].max(self.w.reach_decay * val[b as usize]);
+                    }
+                    if passable(b) {
+                        next[b as usize] =
+                            next[b as usize].max(self.w.reach_decay * val[a as usize]);
+                    }
+                }
+                val = next;
+            }
+            val
+        };
+        self.ctx = RoadCtx {
+            my_dist,
+            opp_dist,
+            reach: relax(horizon.saturating_sub(1), &seed),
+            // Exactly two extra roads: the counterfactual horizon if the Road
+            // Building card in hand were played.
+            reach_rb: relax(horizon.saturating_add(1).min(8), &seed),
+            horizon,
+        };
     }
 
     /// Positional value of a node for a settlement.
@@ -417,25 +656,21 @@ impl HeuristicBot {
             .sum()
     }
 
-    /// Value of a road: it opens settlement spots and extends our longest run.
+    /// Value of a road: what it opens up, plus progress toward longest road.
+    ///
+    /// The reach values are propagated over as many roads as could actually
+    /// be laid this turn, so with Road Building in hand the bot sees spots
+    /// three or four roads out instead of only its next settlement.
     fn road_value(&self, v: &View, e: u8) -> f64 {
         let topo = crate::board::topology();
         let mut best = 0.0f64;
         for &n in topo.edge_nodes[e as usize].iter() {
-            if v.node(n).is_some() {
-                continue;
-            }
-            if v.node_open(n) {
-                // Settleable as soon as the road is down.
-                best = best.max(0.55 * self.node_value(v, n));
-            } else {
-                // Look one step further out.
-                for &nb in topo.node_neighbors[n as usize].iter() {
-                    if v.node_open(nb) {
-                        best = best.max(0.22 * self.node_value(v, nb));
-                    }
+            if let Some(pc) = v.node(n) {
+                if pc.owner != v.me() {
+                    continue;
                 }
             }
+            best = best.max(0.55 * self.ctx.reach[n as usize]);
         }
         // Longest road: worth 2 VP, so chasing it can be worth a lot.
         let mine = v.road_len(v.me());
@@ -449,6 +684,141 @@ impl HeuristicBot {
             best += 25.0 * self.w.longest_road_drive.min(2.0);
         } else if holder != Some(v.me()) {
             best += self.w.longest_road_drive * (mine as f64 * 0.5);
+        }
+        best
+    }
+
+    /// The best road available right now, under the current horizon and under
+    /// the horizon two extra roads would buy. The gap is what Road Building
+    /// is worth beyond the four resources it saves.
+    fn reach_gain_from_two_roads(&self, v: &View) -> f64 {
+        let topo = crate::board::topology();
+        let mut now = 0.0f64;
+        let mut with_rb = 0.0f64;
+        for e in 0..N_EDGES as u8 {
+            if v.edge(e).is_some() {
+                continue;
+            }
+            for &n in topo.edge_nodes[e as usize].iter() {
+                if let Some(pc) = v.node(n) {
+                    if pc.owner != v.me() {
+                        continue;
+                    }
+                }
+                // Only edges I can actually start from count.
+                if self.ctx.my_dist[n as usize] > 0 {
+                    continue;
+                }
+                now = now.max(self.ctx.reach[n as usize]);
+                with_rb = with_rb.max(self.ctx.reach_rb[n as usize]);
+            }
+        }
+        (with_rb - now).max(0.0)
+    }
+
+    /// Intersections a settlement here would deny everyone under the distance
+    /// rule. Only counts spots an opponent was actually close to.
+    fn block_value(&self, v: &View, n: u8) -> f64 {
+        if self.w.block_drive <= 0.0 {
+            return 0.0;
+        }
+        let topo = crate::board::topology();
+        let mut denied = 0.0;
+        for &nb in topo.node_neighbors[n as usize].iter() {
+            if !v.node_open(nb) {
+                continue;
+            }
+            let theirs = self.ctx.opp_dist[nb as usize];
+            let mine = self.ctx.my_dist[nb as usize];
+            if theirs <= 2 && theirs <= mine {
+                denied += v.board().node_pips(nb) as f64;
+            }
+        }
+        self.w.block_drive * denied
+    }
+
+    /// Extra value of playing a knight *before* the roll rather than after.
+    ///
+    /// Moving the robber changes production on the roll that follows it. A
+    /// knight played now therefore affects this turn's roll: it can free one
+    /// of my own hexes so it pays out immediately, and it can block an
+    /// opponent's hex so they miss this roll too. Played after the roll,
+    /// neither applies until next time round.
+    ///
+    /// Discounted by the one-in-six chance this roll is a 7, which moves the
+    /// robber again and throws the placement away.
+    fn knight_preroll_premium(&self, v: &View) -> f64 {
+        let topo = crate::board::topology();
+        let b = v.board();
+        let rh = v.robber();
+        let rh_prob = crate::types::prob(b.numbers[rh as usize]);
+
+        // Cards I am currently being denied on the blocked hex.
+        let mut my_gain = 0.0;
+        for &n in topo.hex_nodes[rh as usize].iter() {
+            if let Some(pc) = v.node(n) {
+                if pc.owner == v.me() {
+                    my_gain += pc.building.yield_count() as f64 * rh_prob;
+                }
+            }
+        }
+
+        // Cards I could deny this roll by moving the robber onto someone.
+        // Weighted toward the leader, and more so as the game nears its end.
+        let leader = self.leader(v);
+        let urgency = {
+            let lead = v.leader_vp() as f64;
+            let target = v.vp_target() as f64;
+            // 0 early, rising to 1 as the leader closes on the target.
+            ((lead - target + 4.0) / 4.0).clamp(0.0, 1.0)
+        };
+        let mut best_deny = 0.0f64;
+        for h in 0..N_HEXES as u8 {
+            if h == rh || b.hex_resource(h).is_none() {
+                continue;
+            }
+            let p = crate::types::prob(b.numbers[h as usize]);
+            let mut deny = 0.0;
+            let mut hits_me = false;
+            for &n in topo.hex_nodes[h as usize].iter() {
+                if let Some(pc) = v.node(n) {
+                    if pc.owner == v.me() {
+                        hits_me = true;
+                    } else {
+                        let weight = if pc.owner == leader { 1.0 } else { 0.35 };
+                        deny += weight * pc.building.yield_count() as f64 * p;
+                    }
+                }
+            }
+            if !hits_me {
+                best_deny = best_deny.max(deny);
+            }
+        }
+
+        (my_gain + urgency * best_deny) * (5.0 / 6.0)
+    }
+
+    /// Value of the best non-knight development card in hand, which playing a
+    /// knight before the roll would forfeit -- only one card may be played
+    /// per turn.
+    fn alternative_dev_value(&self, v: &View) -> f64 {
+        if v.dev_played_this_turn() {
+            return 0.0;
+        }
+        let d = v.my_dev();
+        let mut best = 0.0f64;
+        if d[DevCard::RoadBuilding.idx()] > 0 {
+            best = best.max(12.0 + self.w.w_road + 2.0 * self.reach_gain_from_two_roads(v));
+        }
+        if d[DevCard::Monopoly.idx()] > 0 {
+            let est = Resource::ALL
+                .iter()
+                .map(|&r| self.estimate_opponent_holdings(v, r))
+                .fold(0.0f64, f64::max);
+            best = best.max(4.0 + 6.0 * est);
+        }
+        if d[DevCard::YearOfPlenty.idx()] > 0 {
+            best = best.max(10.0);
         }
         best
     }
@@ -524,7 +894,9 @@ impl HeuristicBot {
 
         let base = match *a {
             Action::EndTurn => 0.0,
-            Action::Roll => 1000.0,
+            // Rolling is the default before the roll; a knight has to earn
+            // being played first, rather than being locked out by a constant.
+            Action::Roll => 0.0,
 
             Action::PlaceInitialSettlement(n) => {
                 100.0 + self.node_value(v, n) + self.complement_bonus(v, n)
@@ -535,7 +907,9 @@ impl HeuristicBot {
                 // A city doubles that node's yield.
                 self.w.w_city + 2.2 * v.board().node_pips(n) as f64
             }
-            Action::BuildSettlement(n) => self.w.w_settlement + 1.3 * self.node_value(v, n),
+            Action::BuildSettlement(n) => {
+                self.w.w_settlement + 1.3 * self.node_value(v, n) + self.block_value(v, n)
+            }
             Action::BuildRoad(e) => {
                 let r = self.w.w_road + self.road_value(v, e);
                 // Free roads from Road Building should always be used.
@@ -570,9 +944,38 @@ impl HeuristicBot {
                 {
                     s += 20.0;
                 }
-                s
+                if v.is_preroll() {
+                    // Before the roll the question is not whether to play the
+                    // knight -- it can still be played afterwards -- but
+                    // whether playing it *now* is worth more. So score the
+                    // timing difference alone, not the card.
+                    //
+                    // Against it: a 7 on this roll moves the robber again and
+                    // throws the placement away, and playing now uses up the
+                    // turn's one development card, which may be better spent.
+                    let premium = self.w.knight_timing * self.knight_preroll_premium(v);
+                    let forgone = (self.alternative_dev_value(v) - s).max(0.0);
+                    premium - forgone - 1.0
+                } else {
+                    s
+                }
             }
-            Action::PlayRoadBuilding => 12.0 + self.w.w_road,
+            Action::PlayRoadBuilding => {
+                // Worth the four resources it saves, plus whatever the extra
+                // reach opens up that was out of range before.
+                //
+                // Plowing to a new spot only pays off if it can be settled
+                // before somebody else takes it, so the reach is worth far
+                // more when a settlement is already affordable.
+                // Conditioning this on holding settlement resources was
+                // tried and is unreachable: whenever a settlement is
+                // affordable the bot simply builds it, which outscores this
+                // card by a wide margin, so the two states co-occur in only
+                // 2% of plays. Capturing "plow two roads then settle the
+                // better spot" needs the sequence scored as one package,
+                // which this greedy single-action scorer cannot express.
+                12.0 + self.w.w_road + 2.0 * self.reach_gain_from_two_roads(v)
+            }
             Action::PlayYearOfPlenty(a1, b1) => {
                 let mut h2 = hand;
                 h2[a1.idx()] += 1;
@@ -653,6 +1056,22 @@ impl Policy for HeuristicBot {
             && matches!(actions[0], Action::PlaceInitialSettlement(_))
         {
             return self.rng.random_range(0..actions.len());
+        }
+        // The road geography is only consulted by placement, road, Road
+        // Building and pre-roll knight decisions. Most turns end with a list
+        // of trades and EndTurn, where computing it would be wasted work.
+        if actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BuildRoad(_)
+                    | Action::BuildSettlement(_)
+                    | Action::PlaceInitialRoad(_)
+                    | Action::PlaceInitialSettlement(_)
+                    | Action::PlayRoadBuilding
+                    | Action::PlayKnight
+            )
+        }) {
+            self.build_ctx(v);
         }
         let mut best = 0usize;
         let mut best_s = f64::MIN;

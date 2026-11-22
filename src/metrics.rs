@@ -62,9 +62,14 @@ pub struct PlayerMetrics {
     pub dice_sum: u32,
     pub dev_bought: u32,
     pub knights_played: u32,
+    /// Knights played before the roll, to capture this turn's production.
+    pub knights_preroll: u32,
     pub monopolies_played: u32,
     pub yops_played: u32,
     pub road_buildings_played: u32,
+    /// Road Buildings played while a settlement was already affordable --
+    /// i.e. where plowing to a new spot could be completed at once.
+    pub road_buildings_settle_ready: u32,
     pub roads_built: u32,
     pub settlements_built: u32,
     pub cities_built: u32,

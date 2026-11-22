@@ -312,17 +312,26 @@ impl Game {
             }
 
             Action::PlayKnight => {
+                let preroll = !self.st.rolled;
                 self.spend_dev(p, DevCard::Knight);
                 self.st.players[p as usize].knights_played += 1;
                 self.st.players[p as usize].metrics.knights_played += 1;
+                if preroll {
+                    self.st.players[p as usize].metrics.knights_preroll += 1;
+                }
                 self.st.update_largest_army();
                 self.st.robber_from_knight = true;
                 self.st.phase = Phase::MovingRobber;
             }
 
             Action::PlayRoadBuilding => {
+                let ready = can_afford(&self.st.players[p as usize].hand, &COST_SETTLEMENT)
+                    && self.st.players[p as usize].settlements_left > 0;
                 self.spend_dev(p, DevCard::RoadBuilding);
                 self.st.players[p as usize].metrics.road_buildings_played += 1;
+                if ready {
+                    self.st.players[p as usize].metrics.road_buildings_settle_ready += 1;
+                }
                 self.st.free_roads = 2.min(self.st.players[p as usize].roads_left);
             }
 

@@ -90,8 +90,25 @@ fn games_finish_and_the_winner_has_the_target() {
         let wp = &rec.players[w as usize];
         assert!(wp.won);
         assert!(wp.vp >= cfg.vp_target, "winner had {} VP", wp.vp);
-        // Nobody else should be at the target.
-        assert_eq!(rec.players.iter().filter(|p| p.vp >= cfg.vp_target).count(), 1);
+        // Exactly one player may be *declared* the winner -- but more than
+        // one may sit at or above the target. A player can be pushed to 10 on
+        // somebody else's turn, when a road or settlement transfers the
+        // longest-road card to them, and the rules only let you win on your
+        // own turn. If another player reaches the target first, the game ends
+        // with two players at 10 and one winner. This happens in roughly 1
+        // game in 1300.
+        assert_eq!(rec.players.iter().filter(|p| p.won).count(), 1);
+        for p in &rec.players {
+            if !p.won && p.vp >= cfg.vp_target {
+                assert!(
+                    p.metrics.had_longest_road || p.metrics.had_largest_army,
+                    "seat {} reached {} VP without winning and without a \
+                     special card, which should be impossible",
+                    p.seat,
+                    p.vp
+                );
+            }
+        }
         // The victory points must add up from their parts.
         let m = &wp.metrics;
         let from_buildings = 2 + m.settlements_built as u8 + m.cities_built as u8;

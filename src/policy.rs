@@ -104,6 +104,20 @@ impl<'a> View<'a> {
     pub fn free_roads(&self) -> u8 {
         self.st.free_roads
     }
+    /// True before this turn's roll. The robber affects the *next* roll, so a
+    /// knight played now changes this turn's production and one played after
+    /// the roll does not.
+    #[inline]
+    pub fn is_preroll(&self) -> bool {
+        self.st.phase == crate::state::Phase::PreRoll
+    }
+    /// A development card has already been played this turn, so no other may
+    /// be. Playing a knight before rolling therefore costs the chance to play
+    /// Monopoly or Road Building later in the same turn.
+    #[inline]
+    pub fn dev_played_this_turn(&self) -> bool {
+        self.st.dev_played_this_turn
+    }
     /// Exchange rate for giving away `r` (2, 3 or 4 to 1).
     #[inline]
     pub fn trade_rate(&self, r: Resource) -> u8 {

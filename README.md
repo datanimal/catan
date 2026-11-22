@@ -139,6 +139,63 @@ more readily (+125% offer rate, −44% acceptance threshold) while guarding the
 leader more (+28%), favour grain and ore over wood and brick, buy 29% fewer
 development cards, and weight single-intersection resource diversity 59% less.
 
+## Timing, reach and denial: what was missing and what it was worth
+
+An early version scored `Roll` at a flat 1000, which made it arithmetically
+impossible for any bot ever to play a knight before rolling — the maximum
+knight score was about 106. That was a specification bug, not a tuning
+choice. The robber changes production on *the roll that follows it*, so a
+knight played before you roll affects **this** roll: it can free one of your
+own hexes so it pays out immediately, or deny an opponent on your roll too.
+Played afterwards, neither applies until next time round.
+
+The pre-roll decision is now scored as a pure timing question — the knight can
+still be played after the roll, so what is priced is the difference:
+
+```
+premium = (my cards freed this roll + endgame_urgency * cards denied to the leader) * 5/6
+score   = knight_timing * premium - forgone_other_dev_card - preroll_risk
+```
+
+The 5/6 is the chance this roll is not a 7, which would move the robber again
+and throw the placement away. Pre-roll knights went from **0% to 41-59%** of
+all knights played.
+
+Parameter sweeps, each 15k games against three copies of a bot with all four
+features off, where 25.0% is break-even:
+
+| feature | parameter | off | best | gain |
+|---|---|---|---|---|
+| road reach weighting | `reach_decay` 0.15 → 0.8 | 24.7% | **25.8%** | +1.1pp |
+| pre-roll knights | `knight_timing` 0 → 15 | 24.7% | **25.4%** | +0.7pp |
+| racing for contested spots | `contest_drive` 0 → 1.5-3 | 24.7% | 25.7% | +0.5-1.0pp, noisy |
+| denying opponents spots | `block_drive` 0 → 3 | 24.7% | 24.6% | **none** |
+
+Three results worth recording, because each is a null:
+
+- **Looking further than two roads ahead is worthless.** `road_horizon_base`
+  measured flat from 2 through 6 (26.0% / 26.0% / 25.9% / 25.9% / 25.9%). The
+  gain above came from weighting the spot two roads out more heavily, not from
+  a longer horizon. Distant board information is not actionable because the
+  board changes before you get there.
+- **Denial has no measurable value** at any setting. It is off by default. The
+  hook is kept because the null may simply reflect having no lookahead.
+- **"Plow with Road Building, then settle" cannot be expressed here.**
+  Conditioning the card on holding settlement resources changes nothing, and
+  instrumenting it shows why: Road Building is played while a settlement is
+  affordable in only **2% of plays**, because whenever a settlement *is*
+  affordable the bot simply builds it, which outscores the card by a wide
+  margin. Capturing the play needs `play card -> lay two roads -> settle`
+  scored as one package against "settle the worse spot I can already reach".
+  A greedy single-action scorer cannot represent that, so this remains a known
+  gap rather than a tuning problem.
+
+Together the live features are worth about +0.7pp of win rate, and they raise
+`tuned` from 31.0% to **33.3%** against the preset field. Notably they do not
+raise mean victory points (7.49 against 7.52) — timing and denial are zero-sum
+tempo effects that change who crosses ten first rather than how many points
+anyone accumulates.
+
 ## Valuing opening positions in pips
 
 ```bash
