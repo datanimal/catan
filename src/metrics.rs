@@ -271,6 +271,41 @@ pub struct OpeningFeatures {
     pub numbers: Vec<u8>,
 }
 
+/// One player's position at a single moment, compact enough to record every
+/// turn of every game.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlayerSample {
+    /// Score visible at the table.
+    pub vp_public: u8,
+    /// True score, hidden victory-point cards included.
+    pub vp_true: u8,
+    /// Engine size in pips, ignoring the robber.
+    pub pips: u16,
+    pub hand_size: u8,
+    pub dev_in_hand: u8,
+    pub knights: u8,
+    /// Pieces **on the board**, not pieces built during play. A position
+    /// supplied from outside has no history, so every feature the model uses
+    /// has to be readable from the board as it stands.
+    pub settlements: u8,
+    pub cities: u8,
+    pub roads: u8,
+    pub breadth: u8,
+    pub longest_road: bool,
+    pub largest_army: bool,
+    /// Cards taken in so far, saturating at u16.
+    pub inflow: u16,
+}
+
+/// The whole table at the start of one turn.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TurnSample {
+    pub turn: u32,
+    /// Whose turn is starting.
+    pub current: u8,
+    pub players: Vec<PlayerSample>,
+}
+
 /// One player's line in a finished game.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerResult {
@@ -293,6 +328,10 @@ pub struct GameRecord {
     pub players: Vec<PlayerResult>,
     /// Count of each dice outcome 2..=12, for verifying the dice.
     pub roll_histogram: [u32; 13],
+    /// The whole table at the start of every turn. Empty unless
+    /// `GameConfig::record_timeline` was set, since it costs a few kilobytes
+    /// per game and most runs do not need it.
+    pub timeline: Vec<TurnSample>,
 }
 
 impl GameRecord {

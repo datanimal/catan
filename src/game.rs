@@ -35,6 +35,10 @@ pub struct GameConfig {
     pub max_proposals: u8,
     /// Switch off player-to-player trading entirely.
     pub allow_player_trades: bool,
+    /// Record the whole table at the start of each turn. Needed to train or
+    /// drive a per-turn win-probability estimate; off by default because it
+    /// costs a few kilobytes a game.
+    pub record_timeline: bool,
 }
 
 impl Default for GameConfig {
@@ -49,6 +53,7 @@ impl Default for GameConfig {
             hand_limit: 7,
             max_proposals: 4,
             allow_player_trades: true,
+            record_timeline: false,
         }
     }
 }
@@ -61,6 +66,7 @@ pub struct Game {
     cfg: GameConfig,
     seed: u64,
     roll_hist: [u32; 13],
+    timeline: Vec<crate::metrics::TurnSample>,
     dice_deck: Vec<u8>,
     /// Whether each phase boundary has been recorded yet. Index 0 is the end
     /// of setup, which is the baseline the early phase is measured from.
@@ -91,8 +97,40 @@ impl Game {
             cfg,
             seed,
             roll_hist: [0; 13],
+            timeline: Vec::new(),
             dice_deck: Vec::new(),
             snapped: [false; 3],
+        }
+    }
+
+    /// Resume from an existing position rather than dealing a fresh game.
+    ///
+    /// This is what makes an externally supplied position playable: a live
+    /// game, a replay log or a hand-entered board can be rolled out to
+    /// completion. Metrics that depend on history (opening features, cards
+    /// produced so far) are necessarily absent, so only the outcome of a
+    /// resumed game is meaningful.
+    pub fn from_state(
+        st: GameState,
+        cfg: GameConfig,
+        policies: Vec<Box<dyn Policy>>,
+        seed: u64,
+    ) -> Game {
+        assert_eq!(policies.len(), st.n_players(), "one policy per seat");
+        let names = policies.iter().map(|p| p.name()).collect();
+        Game {
+            st,
+            policies,
+            names,
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            cfg,
+            seed,
+            roll_hist: [0; 13],
+            timeline: Vec::new(),
+            dice_deck: Vec::new(),
+            // A resumed game has no setup to baseline from, so the phase
+            // snapshots are suppressed rather than recorded misleadingly.
+            snapped: [true, true, true],
         }
     }
 
@@ -661,7 +699,41 @@ impl Game {
         }
     }
 
+    /// Snapshot the whole table. Shared by the timeline and by any caller
+    /// that wants a position summary.
+    pub fn sample_table(&self) -> crate::metrics::TurnSample {
+        crate::metrics::TurnSample {
+            turn: self.st.turn,
+            current: self.st.current,
+            players: (0..self.st.n_players() as u8)
+                .map(|q| crate::metrics::PlayerSample {
+                    vp_public: self.st.vp_public(q),
+                    vp_true: self.st.vp(q),
+                    pips: self.st.raw_pips(q).min(u16::MAX as u32) as u16,
+                    hand_size: self.st.players[q as usize].hand_size().clamp(0, 255) as u8,
+                    dev_in_hand: self.st.players[q as usize].dev_in_hand(),
+                    knights: self.st.players[q as usize].knights_played,
+                    settlements: MAX_SETTLEMENTS
+                        - self.st.players[q as usize].settlements_left,
+                    cities: MAX_CITIES - self.st.players[q as usize].cities_left,
+                    roads: MAX_ROADS - self.st.players[q as usize].roads_left,
+                    breadth: self.st.res_breadth(q),
+                    longest_road: self.st.longest_road == Some(q),
+                    largest_army: self.st.largest_army == Some(q),
+                    inflow: self.st.players[q as usize]
+                        .metrics
+                        .total_inflow()
+                        .clamp(0, u16::MAX as i32) as u16,
+                })
+                .collect(),
+        }
+    }
+
     fn note_turn_start(&mut self) {
+        if self.cfg.record_timeline {
+            let s = self.sample_table();
+            self.timeline.push(s);
+        }
         let p = self.st.current;
         let pips = self.st.raw_pips(p) as f64;
         let turn = self.st.turn;
@@ -739,6 +811,7 @@ impl Game {
             timed_out: winner.is_none(),
             players,
             roll_histogram: self.roll_hist,
+            timeline: std::mem::take(&mut self.timeline),
         }
     }
 }

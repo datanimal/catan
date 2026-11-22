@@ -243,6 +243,76 @@ the rarity above, there is a strategic reason to expect this in a four-player
 game: blocking one opponent helps the other two as much as it helps you, so it
 is a private cost paid for a public good.
 
+## Evaluating a position from outside the simulator
+
+```bash
+# emit an example position from a real simulated game
+catan_sim position --seed 11 --until-vp 6 --out pos.json
+
+# evaluate it, both ways
+catan_sim eval --position pos.json --model winmodel.json --rollouts 4000
+catan_sim eval --position pos.json --rollouts 2000 --json   # for an overlay
+```
+
+`position.json` is the integration contract: anything that can emit it can be
+evaluated, which keeps platform-specific log parsing at the edges rather than
+in the engine. Positions are **validated** against the same invariants the
+engine holds itself to, so a transcription slip is reported instead of being
+silently scored — a win probability computed from an impossible board is worse
+than no number at all. Rejected cases include two buildings on one
+intersection, a distance-rule violation, more resources than exist, six
+cities, an unknown terrain name and a path index that does not exist.
+
+Two things in the format are worth knowing, both found by the round-trip test:
+
+- **Longest road and largest army must be recorded explicitly.** They cannot
+  be derived from the board, because when players tie the card stays with
+  whoever got there first — a fact about history, not position. Both cards are
+  face up, so a spectator can read them off. Claims are checked against the
+  5-road and 3-knight thresholds.
+- **Port access is derived, not stored.** A settlement on a port intersection
+  trades at that port's rate; forgetting to grant it would silently make every
+  rollout trade at 4:1.
+
+Hands may be given as an exact mix, or just as a size when the contents are
+unknown. Development cards are taken as a count plus however many
+victory-point cards are known, with unknown faces split in the deck's own
+proportions.
+
+### Two evaluators, and which to use
+
+| | latency | accuracy |
+|---|---|---|
+| trained model | microseconds | calibrated in aggregate, but 12-16 points off per position |
+| Monte Carlo rollouts | **1.3s for 2000** on 4 cores | the reference |
+
+Rollouts play the position out and count, needing no training. With
+`--resample-hands` the hidden cards are redrawn from the bank before each
+rollout, keeping the publicly visible hand *sizes*, so the answer averages
+over the hands the position is consistent with rather than betting on one of
+them.
+
+**For a live meter, use rollouts.** Measured against rollouts of the same
+position, 30 positions per stage:
+
+| stage | mean gap | worst gap | correlation |
+|---|---|---|---|
+| opening | 16.4% | 39.9% | 0.503 |
+| early | 13.7% | 52.2% | 0.647 |
+| middle | 15.5% | 48.0% | 0.896 |
+| late | 12.2% | 41.9% | 0.950 |
+| endgame | 11.4% | 54.8% | 0.871 |
+
+The instant model is well calibrated *in aggregate* and still lands 12-16
+points from the truth on a typical single position, because 21 summary
+features cannot capture what the board geometry does — which intersections are
+open, who is blocked, where the roads can still go. Its errors average out,
+which is what calibration measures, but a viewer watching one game sees the
+individual error, not the average. A real Catan turn takes 20-60 seconds, so
+1.3 seconds of rollout per update is not a constraint. The model is the right
+tool for scrubbing a whole game instantly or for bulk analysis, not for a
+number on screen.
+
 ## Live win probability (a spectator "eval bar")
 
 ```bash
@@ -295,13 +365,37 @@ The strongest predictors at the end of the mid game:
 | `breadth` | +0.367 | +24.3 |
 | `own_turns` | -0.048 | -17.1 |
 
+### Per-turn models
+
+```bash
+catan_sim train-model -n 20000 --out winmodel.json --check-rollouts 30
+```
+
+`GameConfig::record_timeline` samples the whole table at the start of every
+turn, which is what a per-turn estimate has to be trained on. It is off by
+default because it costs a few kilobytes a game.
+
+Three things were needed to make a per-turn model behave:
+
+- **A model per stage.** One set of coefficients cannot serve a whole game:
+  early on almost nothing separates the players, and late a single point is
+  nearly decisive. A single fit left calibration out by **25 points** in the
+  opening fifth. Fitting each progress band separately brought that to 4%.
+  Bands are set by the leader's share of the target, which is observable live.
+- **Normalising across the table.** Each seat is fitted on its own, so nothing
+  makes the probabilities add up; exactly one player wins, so they must.
+- **Recalibrating afterwards.** That division tilts the result — positions
+  quoted at 55% actually won 59% — so a two-parameter Platt correction is
+  fitted per stage. Calibration then reads 5%->5%, 15%->15%, 25%->25%,
+  35%->35%, 45%->45%, 55%->56%.
+
+Held out: AUC 0.782 overall, rising from 0.626 in the opening to 0.909 in the
+endgame, with a worst calibration gap of 3.5%.
+
 Two limits to be clear about. The probabilities are conditional on *these bots*
 finishing the game, so against strong human play the ranking should survive but
-the numbers would need recalibrating on human games. And the model currently
-only scores the three phase boundaries, because that is where snapshots are
-taken; a live meter needs an estimate on **every turn**, which means recording
-a full timeline rather than three points, and the ability to evaluate an
-arbitrary position supplied from outside the simulator.
+the numbers would need recalibrating on human games. And per-position accuracy
+is the instant model's weak point — see the comparison against rollouts above.
 
 ## Where strategies gain ground: phase snapshots
 
@@ -448,6 +542,19 @@ expectation to within 0.2% in aggregate, the dice pass a chi-squared test
 against 2d6, the dice deck has the same mean with lower variance, seat rotation
 is exactly balanced, win rates sum to one, the skill index is centred on the
 field, and the heuristic bots beat random play.
+
+## What a broadcast overlay still needs
+
+The engine side is done: positions can come in from outside, be validated, and
+be evaluated either instantly or by rollout, with a JSON output mode for an
+overlay to consume. What is missing is the adapter from a specific platform's
+game log to `position.json`. That needs a sample of the log in question rather
+than guesswork — a parser written against a guessed format would produce
+plausible, wrong numbers, which is the worst outcome for something shown on
+screen.
+
+Recalibrating against logged human games is the other high-value step, and the
+same adapter unlocks it.
 
 ## Known limitations
 

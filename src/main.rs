@@ -90,6 +90,64 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         against: Option<Vec<String>>,
     },
+    /// Train a per-turn win-probability model and save it.
+    #[command(name = "train-model")]
+    TrainModel {
+        #[arg(long, short = 'n', default_value_t = 20000)]
+        games: usize,
+        #[arg(long, value_delimiter = ',', default_value = "tuned,city_builder,dev_rush,expander")]
+        players: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        vp: u8,
+        /// Use hidden information too. Off by default, because a spectator
+        /// overlay cannot see it.
+        #[arg(long)]
+        full_info: bool,
+        #[arg(long, default_value = "winmodel.json")]
+        out: String,
+        #[arg(long, default_value_t = 0x7A1E)]
+        seed: u64,
+        /// After training, sample this many positions per stage and compare
+        /// the instant model against Monte Carlo rollouts of the same
+        /// position. 0 skips the check.
+        #[arg(long, default_value_t = 0)]
+        check_rollouts: usize,
+    },
+    /// Write an example position file, taken from a real simulated game.
+    #[command(name = "position")]
+    PositionCmd {
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// Stop once the leader reaches this score, so the position is from
+        /// the middle of a game rather than the start.
+        #[arg(long, default_value_t = 6)]
+        until_vp: u8,
+        #[arg(long, default_value = "position.json")]
+        out: String,
+        #[arg(long, value_delimiter = ',', default_value = "tuned,city_builder,dev_rush,expander")]
+        players: Vec<String>,
+    },
+    /// Evaluate a position supplied from outside the simulator.
+    Eval {
+        /// Position JSON, as written by `position` or by your own exporter.
+        #[arg(long)]
+        position: String,
+        /// Trained model to use for the instant estimate.
+        #[arg(long)]
+        model: Option<String>,
+        /// Monte Carlo rollouts. 0 skips them.
+        #[arg(long, default_value_t = 2000)]
+        rollouts: usize,
+        /// Strategies to roll the position out with.
+        #[arg(long, value_delimiter = ',', default_value = "tuned,tuned,tuned,tuned")]
+        players: Vec<String>,
+        /// Redraw unknown hands each rollout, keeping hand sizes.
+        #[arg(long, default_value_t = true)]
+        resample_hands: bool,
+        /// Emit JSON instead of a table, for an overlay to consume.
+        #[arg(long)]
+        json: bool,
+    },
     #[command(name = "winprob")]
     /// Fit and score a live win-probability model, as a spectator overlay
     /// would need. Reports how well it ranks positions and whether its
@@ -196,6 +254,336 @@ fn main() {
             cfg.rotate_seats = false;
             let rec = sim::run_one(&cfg, 0);
             print_single(&rec);
+        }
+
+        Cmd::TrainModel {
+            games,
+            players,
+            vp,
+            full_info,
+            out,
+            seed,
+            check_rollouts,
+        } => {
+            use catan_sim::winprob::{self, Info};
+            if let Err(e) = sim::check_lineup(&players) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+            let mut cfg = SimConfig::new(players.clone(), games);
+            cfg.base_seed = seed;
+            cfg.game.vp_target = vp;
+            cfg.game.record_timeline = true;
+            println!("simulating {games} games with per-turn recording...");
+            let t0 = std::time::Instant::now();
+            let recs = sim::run(&cfg);
+            let turns: usize = recs.iter().map(|r| r.timeline.len()).sum();
+            println!(
+                "{games} games, {turns} turn samples, {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
+            let info = if full_info { Info::Full } else { Info::Spectator };
+            let Some((model, bins)) =
+                winprob::train_turn_model(&recs, vp, info, players.clone())
+            else {
+                eprintln!("error: not enough data to train");
+                std::process::exit(1);
+            };
+            println!(
+                "\nheld-out: AUC {:.3}, Brier {:.4} against {:.4} for the base rate \
+                 ({:.1}% better)",
+                model.test_auc,
+                model.test_brier,
+                model.test_brier_baseline,
+                100.0 * (1.0 - model.test_brier / model.test_brier_baseline)
+            );
+            println!(
+                "worst calibration gap {:.1}%",
+                100.0 * model.worst_calibration_gap
+            );
+            print!("calibration:");
+            for b in bins.iter().filter(|b| b.n >= 200) {
+                print!("  {:.0}%->{:.0}%", 100.0 * b.mean_predicted, 100.0 * b.actual);
+            }
+            println!();
+            println!("\nper-stage models (bands are the leader's share of the target):");
+            println!(
+                "{:<10}{:>12}{:>10}{:>8}{:>10}{:>14}",
+                "stage", "band", "rows", "AUC", "Brier", "worst gap"
+            );
+            for st in &model.stages {
+                println!(
+                    "{:<10}{:>12}{:>10}{:>8.3}{:>10.4}{:>13.1}%",
+                    st.label,
+                    format!("{:.0}-{:.0}%", 100.0 * st.lo, 100.0 * st.hi.min(1.0)),
+                    st.rows,
+                    st.auc,
+                    st.brier,
+                    100.0 * st.worst_gap
+                );
+            }
+            if check_rollouts > 0 {
+                println!("\ncomparing the instant model with rollouts of the same position:");
+                // Replay held-out games and keep a position from each stage.
+                let mut states = Vec::new();
+                let cut = recs.len() * 7 / 10;
+                let lineup: Vec<catan_sim::bots::Strategy> = players
+                    .iter()
+                    .map(|n| catan_sim::bots::Strategy::parse(n).unwrap())
+                    .collect();
+                let mut per_band = [0usize; 5];
+                'outer: for idx in cut..recs.len() {
+                    let mut gcfg = cfg.game.clone();
+                    gcfg.record_timeline = false;
+                    let pols = (0..players.len())
+                        .map(|seat| lineup[seat].make(recs[idx].seed ^ ((seat as u64 + 1) << 32)))
+                        .collect();
+                    let mut g = catan_sim::game::Game::new(gcfg, pols, recs[idx].seed);
+                    while g.st.phase != catan_sim::state::Phase::Over {
+                        g.step();
+                        if g.st.phase != catan_sim::state::Phase::PreRoll {
+                            continue;
+                        }
+                        let sample = g.sample_table();
+                        let pr = winprob::progress_of(&sample, vp, info);
+                        let band = winprob::STAGE_BANDS
+                            .iter()
+                            .position(|&(lo, hi, _)| pr >= lo && pr < hi)
+                            .unwrap_or(4);
+                        if per_band[band] >= check_rollouts {
+                            continue;
+                        }
+                        per_band[band] += 1;
+                        states.push((pr, g.st.clone(), sample));
+                        if per_band.iter().all(|&c| c >= check_rollouts) {
+                            break 'outer;
+                        }
+                    }
+                }
+                println!(
+                    "{:<10}{:>11}{:>14}{:>14}{:>14}",
+                    "stage", "positions", "mean gap", "worst gap", "correlation"
+                );
+                for a in winprob::compare_to_rollouts(
+                    &recs, &model, &states, &lineup, 1500, 0xC0DE,
+                ) {
+                    println!(
+                        "{:<10}{:>11}{:>13.1}%{:>13.1}%{:>14.3}",
+                        a.band,
+                        a.positions,
+                        100.0 * a.mean_abs_diff,
+                        100.0 * a.worst_abs_diff,
+                        a.correlation
+                    );
+                }
+            }
+            match model.save(&out) {
+                Ok(()) => println!("\nsaved model to {out}"),
+                Err(e) => eprintln!("could not write {out}: {e}"),
+            }
+        }
+
+        Cmd::PositionCmd {
+            seed,
+            until_vp,
+            out,
+            players,
+        } => {
+            use catan_sim::game::{Game, GameConfig};
+            use catan_sim::position::Position;
+            use catan_sim::state::Phase;
+            if let Err(e) = sim::check_lineup(&players) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+            let mut cfg = GameConfig::default();
+            cfg.n_players = players.len();
+            let pols = players
+                .iter()
+                .enumerate()
+                .map(|(i, n)| catan_sim::bots::make(n, seed * 31 + i as u64).unwrap())
+                .collect();
+            let mut g = Game::new(cfg, pols, seed);
+            // Play until somebody reaches the requested score.
+            while g.st.phase != Phase::Over {
+                let lead = (0..g.st.n_players() as u8)
+                    .map(|p| g.st.vp(p))
+                    .max()
+                    .unwrap_or(0);
+                if lead >= until_vp && g.st.phase == Phase::PreRoll {
+                    break;
+                }
+                g.step();
+            }
+            let pos = Position::from_state(&g.st);
+            match serde_json::to_string_pretty(&pos)
+                .map_err(|e| e.to_string())
+                .and_then(|s| std::fs::write(&out, s).map_err(|e| e.to_string()))
+            {
+                Ok(()) => {
+                    println!(
+                        "wrote a position from turn {} to {out} (scores {:?})",
+                        g.st.turn,
+                        (0..g.st.n_players() as u8).map(|p| g.st.vp(p)).collect::<Vec<_>>()
+                    );
+                }
+                Err(e) => eprintln!("could not write {out}: {e}"),
+            }
+        }
+
+        Cmd::Eval {
+            position,
+            model,
+            rollouts,
+            players,
+            resample_hands,
+            json,
+        } => {
+            use catan_sim::position::Position;
+            use catan_sim::winprob::WinModel;
+            let pos = match Position::load(&position) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("could not read {position}: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let st = match pos.to_state() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let n = st.n_players();
+            let names: Vec<String> = pos
+                .players
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if p.name.is_empty() {
+                        format!("seat{i}")
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect();
+
+            // Instant estimate from a trained model.
+            let model_probs: Option<Vec<f64>> = model.as_ref().and_then(|path| {
+                match WinModel::load(path) {
+                    Ok(m) => {
+                        let sample = catan_sim::metrics::TurnSample {
+                            turn: st.turn,
+                            current: st.current,
+                            players: (0..n as u8)
+                                .map(|q| catan_sim::metrics::PlayerSample {
+                                    vp_public: st.vp_public(q),
+                                    vp_true: st.vp(q),
+                                    pips: st.raw_pips(q).min(u16::MAX as u32) as u16,
+                                    hand_size: st.players[q as usize]
+                                        .hand_size()
+                                        .clamp(0, 255) as u8,
+                                    dev_in_hand: st.players[q as usize].dev_in_hand(),
+                                    knights: st.players[q as usize].knights_played,
+                                    settlements: catan_sim::types::MAX_SETTLEMENTS
+                                        - st.players[q as usize].settlements_left,
+                                    cities: catan_sim::types::MAX_CITIES
+                                        - st.players[q as usize].cities_left,
+                                    roads: catan_sim::types::MAX_ROADS
+                                        - st.players[q as usize].roads_left,
+                                    breadth: st.res_breadth(q),
+                                    longest_road: st.longest_road == Some(q),
+                                    largest_army: st.largest_army == Some(q),
+                                    inflow: 0,
+                                })
+                                .collect(),
+                        };
+                        Some(m.predict_table(&sample))
+                    }
+                    Err(e) => {
+                        eprintln!("could not read model {path}: {e}");
+                        None
+                    }
+                }
+            });
+
+            // Monte Carlo estimate.
+            let roll = if rollouts > 0 {
+                let lineup: Vec<catan_sim::bots::Strategy> = (0..n)
+                    .map(|i| {
+                        catan_sim::bots::Strategy::parse(&players[i % players.len()])
+                            .unwrap_or_else(|| panic!("unknown strategy"))
+                    })
+                    .collect();
+                Some(catan_sim::rollout::evaluate(
+                    &st,
+                    &lineup,
+                    rollouts,
+                    0xE7A1,
+                    resample_hands,
+                ))
+            } else {
+                None
+            };
+
+            if json {
+                let obj = serde_json::json!({
+                    "turn": st.turn,
+                    "current": st.current,
+                    "players": names,
+                    "vp_public": (0..n as u8).map(|p| st.vp_public(p)).collect::<Vec<_>>(),
+                    "model_win_prob": model_probs,
+                    "rollout_win_prob": roll.as_ref().map(|r| r.win_prob.clone()),
+                    "rollout_se": roll.as_ref().map(|r| r.se.clone()),
+                    "rollouts": roll.as_ref().map(|r| r.rollouts),
+                    "unresolved": roll.as_ref().map(|r| r.unresolved),
+                });
+                println!("{obj}");
+            } else {
+                println!("=== position: turn {}, {} to act ===", st.turn, names[st.current as usize]);
+                println!(
+                    "\n{:<12}{:>8}{:>7}{:>10}{:>22}",
+                    "player", "VP seen", "pips", "model", "rollouts"
+                );
+                for i in 0..n {
+                    let m = model_probs
+                        .as_ref()
+                        .map(|p| format!("{:>8.1}%", 100.0 * p[i]))
+                        .unwrap_or_else(|| "       -".into());
+                    let r = roll
+                        .as_ref()
+                        .map(|r| {
+                            format!(
+                                "{:>8.1}% +/- {:.1}",
+                                100.0 * r.win_prob[i],
+                                100.0 * 1.96 * r.se[i]
+                            )
+                        })
+                        .unwrap_or_else(|| "            -".into());
+                    println!(
+                        "{:<12}{:>8}{:>7}{:>10}{:>22}",
+                        names[i],
+                        st.vp_public(i as u8),
+                        st.raw_pips(i as u8),
+                        m,
+                        r
+                    );
+                }
+                if let Some(r) = &roll {
+                    if r.unresolved > 0 {
+                        println!(
+                            "\n{} of {} rollouts hit the turn limit",
+                            r.unresolved, r.rollouts
+                        );
+                    }
+                    println!(
+                        "\nrollouts use {} and {} unknown hands",
+                        players.join("/"),
+                        if resample_hands { "redraw" } else { "keep" }
+                    );
+                }
+            }
         }
 
         Cmd::WinProb {
@@ -464,6 +852,7 @@ fn main() {
                 hand_limit,
                 max_proposals: 4,
                 allow_player_trades: !no_trades,
+                record_timeline: false,
             };
             let cfg = SimConfig {
                 games,
