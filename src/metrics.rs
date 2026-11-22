@@ -214,6 +214,17 @@ pub struct PhaseSnapshot {
     /// Turns this player has taken.
     pub own_turns: u32,
     pub vp: u8,
+    /// Score visible to the table: excludes hidden victory-point cards. This
+    /// is what a spectator overlay could actually read off a live game.
+    pub vp_public: u8,
+    /// Resource cards in hand. The count is public; the contents are not.
+    pub hand_size: i16,
+    /// Unplayed development cards held. Count public, faces hidden.
+    pub dev_in_hand: u8,
+    pub has_longest_road: bool,
+    pub has_largest_army: bool,
+    /// Distinct resources the player's buildings can produce.
+    pub breadth: u8,
     /// Every card taken in so far.
     pub inflow: i32,
     /// Engine size: pips of their buildings.

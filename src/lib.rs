@@ -26,3 +26,4 @@ pub mod sim;
 pub mod state;
 pub mod tune;
 pub mod types;
+pub mod winprob;

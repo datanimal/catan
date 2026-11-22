@@ -243,6 +243,66 @@ the rarity above, there is a strategic reason to expect this in a four-player
 game: blocking one opponent helps the other two as much as it helps you, so it
 is a private cost paid for a public good.
 
+## Live win probability (a spectator "eval bar")
+
+```bash
+catan_sim winprob -n 40000
+```
+
+Fits a logistic model from position to win probability and reports whether it
+could honestly drive an overlay. Two things are measured separately, because a
+model can rank positions well while lying about the odds:
+
+- **Discrimination** (AUC): does it put the eventual winner ahead?
+- **Calibration** (reliability table, Brier skill): when it says 70%, do they
+  win 70% of the time?
+
+Everything is fitted on the first 70% of games and scored on the last 30%,
+split by game rather than by row so that the four players of one game never
+straddle the split — their outcomes are dependent.
+
+Two models are fitted at each phase boundary: one on **spectator-visible**
+information only (public score, piece counts, hand *sizes*, cards played face
+up) and one on the **full state** including hidden victory-point cards. The gap
+between them is the price of Catan's hidden information.
+
+Out-of-sample, 40k games:
+
+| stage | info | AUC | Brier skill | worst calibration gap |
+|---|---|---|---|---|
+| after setup | spectator | 0.623 | 3.7% | 1.6% |
+| end of early | spectator | 0.703 | 10.3% | 2.5% |
+| **end of mid** | **spectator** | **0.830** | **28.6%** | **1.7%** |
+| end of mid | full state | 0.837 | 30.1% | 2.3% |
+
+The mid-game reliability table reads 5%->5%, 14%->14%, 25%->25%, 35%->35%,
+45%->46%, 55%->55%, 65%->64%, 75%->76%, 84%->85%, 93%->94%. That is honest
+enough to put on screen.
+
+**Hidden information costs almost nothing** (AUC 0.830 against 0.837), which is
+the surprising result. The reason is that the *count* of unplayed development
+cards is public and is by far the strongest single predictor — holding three
+cards signals hidden victory points without anyone needing to see their faces.
+So an overlay does not need to cheat.
+
+The strongest predictors at the end of the mid game:
+
+| feature | coefficient | t |
+|---|---|---|
+| `dev_in_hand` | +0.781 | +85.9 |
+| `pips_lead` (engine size over best rival) | +0.059 | +47.9 |
+| `hand_size` | +0.083 | +25.3 |
+| `breadth` | +0.367 | +24.3 |
+| `own_turns` | -0.048 | -17.1 |
+
+Two limits to be clear about. The probabilities are conditional on *these bots*
+finishing the game, so against strong human play the ranking should survive but
+the numbers would need recalibrating on human games. And the model currently
+only scores the three phase boundaries, because that is where snapshots are
+taken; a live meter needs an estimate on **every turn**, which means recording
+a full timeline rather than three points, and the ability to evaluate an
+arbitrary position supplied from outside the simulator.
+
 ## Where strategies gain ground: phase snapshots
 
 Aggregate win rates hide *when* a strategy works. Every player's position is

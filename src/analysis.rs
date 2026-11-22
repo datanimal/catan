@@ -584,7 +584,7 @@ impl Ols {
 }
 
 /// Invert a square matrix by Gauss-Jordan elimination.
-fn invert(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+pub(crate) fn invert(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let n = m.len();
     let mut a: Vec<Vec<f64>> = m
         .iter()

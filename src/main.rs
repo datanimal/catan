@@ -90,6 +90,18 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         against: Option<Vec<String>>,
     },
+    #[command(name = "winprob")]
+    /// Fit and score a live win-probability model, as a spectator overlay
+    /// would need. Reports how well it ranks positions and whether its
+    /// probabilities are honest.
+    WinProb {
+        #[arg(long, short = 'n', default_value_t = 40000)]
+        games: usize,
+        #[arg(long, value_delimiter = ',', default_value = "tuned,city_builder,dev_rush,expander")]
+        players: Vec<String>,
+        #[arg(long, default_value_t = 0xB0A7)]
+        seed: u64,
+    },
     /// Value opening positions in pips, using randomised openings.
     Placement {
         #[arg(long, short = 'n', default_value_t = 40000)]
@@ -184,6 +196,83 @@ fn main() {
             cfg.rotate_seats = false;
             let rec = sim::run_one(&cfg, 0);
             print_single(&rec);
+        }
+
+        Cmd::WinProb {
+            games,
+            players,
+            seed,
+        } => {
+            if let Err(e) = sim::check_lineup(&players) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+            let mut cfg = SimConfig::new(players.clone(), games);
+            cfg.base_seed = seed;
+            let recs = sim::run(&cfg);
+            println!("=== live win probability ===");
+            println!(
+                "{games} games, lineup {}",
+                players.join(", ")
+            );
+            println!(
+                "models fitted on the first 70% of games and scored on the last 30%\n"
+            );
+            use catan_sim::winprob::{self, Info};
+            for (marker, label) in [(0usize, "after setup"), (1, "end of early"), (2, "end of mid")]
+            {
+                println!("--- {label} ---");
+                println!(
+                    "{:<12} {:>9} {:>8} {:>10} {:>12} {:>14}",
+                    "information", "test n", "AUC", "Brier", "vs base rate", "worst bin gap"
+                );
+                for info in [Info::Spectator, Info::Full] {
+                    let Some(r) = winprob::evaluate(&recs, marker, info) else {
+                        continue;
+                    };
+                    println!(
+                        "{:<12} {:>9} {:>8.3} {:>10.4} {:>11.1}% {:>13.1}%",
+                        if info == Info::Spectator { "spectator" } else { "full state" },
+                        r.test_n,
+                        r.test_auc,
+                        r.test_brier,
+                        100.0 * r.skill(),
+                        100.0 * r.max_miscalibration
+                    );
+                }
+                // Reliability table for the spectator model, which is the one
+                // an overlay could actually run.
+                if let Some(r) = winprob::evaluate(&recs, marker, Info::Spectator) {
+                    print!("  calibration (spectator):");
+                    for b in r.bins.iter().filter(|b| b.n >= 100) {
+                        print!(
+                            "  {:.0}%->{:.0}%",
+                            100.0 * b.mean_predicted,
+                            100.0 * b.actual
+                        );
+                    }
+                    println!();
+                }
+                println!();
+            }
+            // What the overlay would key off.
+            if let Some(r) = winprob::evaluate(&recs, 2, Info::Spectator) {
+                println!("--- what drives the estimate at the end of the mid game ---");
+                let mut ord: Vec<usize> = (0..r.fit.coef.len()).collect();
+                ord.sort_by(|&a, &b| {
+                    (r.fit.coef[b].abs() / r.fit.se[b].max(1e-9))
+                        .partial_cmp(&(r.fit.coef[a].abs() / r.fit.se[a].max(1e-9)))
+                        .unwrap()
+                });
+                for &i in ord.iter().take(8) {
+                    println!(
+                        "  {:<16} {:>+8.3}  (t = {:+.1})",
+                        r.fit.names[i],
+                        r.fit.coef[i],
+                        r.fit.coef[i] / r.fit.se[i].max(1e-9)
+                    );
+                }
+            }
         }
 
         Cmd::Placement {
