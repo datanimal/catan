@@ -88,6 +88,10 @@ pub struct PlayerMetrics {
     pub init_nodes: Vec<u8>,
     /// Total pips of the two opening settlements.
     pub init_pips: u32,
+    /// Everything about the opening position, measured once setup ends.
+    pub opening: OpeningFeatures,
+    /// Port access at the end of the game, as a bitmask (see `PlayerState`).
+    pub final_port_mask: u8,
 
     // ---- outcome ----
     pub vp_final: u8,
@@ -185,6 +189,39 @@ impl PlayerMetrics {
             self.last_vp_recorded = vp;
         }
     }
+}
+
+/// Measurable properties of an opening position.
+///
+/// These are the regressors for valuing placement. They are recorded once
+/// setup ends, before any die is rolled, so nothing that happens later can
+/// have influenced them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OpeningFeatures {
+    /// Pips by resource across both opening settlements.
+    pub pips: [u32; N_RES],
+    pub total_pips: u32,
+    /// How many of the five resources the opening touches.
+    pub breadth: u8,
+    /// Brick and lumber pips arriving on the same number -- the road bundle
+    /// paying out in one go.
+    pub paired_road: u32,
+    /// Grain and ore pips arriving on the same number -- the city bundle.
+    pub paired_city: u32,
+    /// Any two resources arriving on the same number.
+    pub paired_any: u32,
+    /// A 2:1 port sits on an opening settlement, by resource.
+    pub port2: [bool; N_RES],
+    /// A 3:1 port sits on an opening settlement.
+    pub port3: bool,
+    /// Roads needed to reach the nearest port of any kind.
+    pub port_dist: u8,
+    /// Roads needed to reach the nearest 3:1 port.
+    pub port3_dist: u8,
+    /// Roads needed to reach the nearest 2:1 port, by resource.
+    pub port2_dist: [u8; N_RES],
+    /// The number tokens the opening touches, for ad hoc analysis.
+    pub numbers: Vec<u8>,
 }
 
 /// One player's line in a finished game.

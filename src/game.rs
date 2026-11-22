@@ -422,10 +422,69 @@ impl Game {
         None
     }
 
+    /// Record each player's opening position once setup is complete and
+    /// before any die is rolled, so these regressors are untouched by play.
+    fn record_openings(&mut self) {
+        use crate::board::PortKind;
+        for p in 0..self.st.n_players() {
+            let nodes = self.st.players[p].metrics.init_nodes.clone();
+            let b = &self.st.board;
+            let mut f = crate::metrics::OpeningFeatures::default();
+            for &n in &nodes {
+                let by = b.node_pips_by_res(n);
+                for i in 0..N_RES {
+                    f.pips[i] += by[i];
+                }
+                let m = b.node_port_mask[n as usize];
+                for r in Resource::ALL {
+                    if m & (1 << r.idx()) != 0 {
+                        f.port2[r.idx()] = true;
+                    }
+                }
+                if m & (1 << 5) != 0 {
+                    f.port3 = true;
+                }
+                for &h in topology().node_hexes[n as usize].iter() {
+                    if b.numbers[h as usize] > 0 {
+                        f.numbers.push(b.numbers[h as usize]);
+                    }
+                }
+            }
+            f.total_pips = f.pips.iter().sum();
+            f.breadth = f.pips.iter().filter(|&&v| v > 0).count() as u8;
+            f.paired_road = b.paired_pips(&nodes, Resource::Brick, Resource::Lumber);
+            f.paired_city = b.paired_pips(&nodes, Resource::Grain, Resource::Ore);
+            f.paired_any = {
+                let t = b.pips_by_res_number(&nodes);
+                (2..=12)
+                    .map(|n| {
+                        let present: u32 = (0..N_RES).filter(|&i| t[i][n] > 0).count() as u32;
+                        // Pips that share a number with a different resource.
+                        if present >= 2 {
+                            (0..N_RES).map(|i| t[i][n]).sum()
+                        } else {
+                            0
+                        }
+                    })
+                    .sum()
+            };
+            f.port_dist = b.port_distance(&nodes, |m| m != 0).unwrap_or(99);
+            f.port3_dist = b.port_distance(&nodes, |m| m & (1 << 5) != 0).unwrap_or(99);
+            for r in Resource::ALL {
+                f.port2_dist[r.idx()] = b
+                    .port_distance(&nodes, |m| m & (1 << r.idx()) != 0)
+                    .unwrap_or(99);
+            }
+            let _ = PortKind::Generic;
+            self.st.players[p].metrics.opening = f;
+        }
+    }
+
     fn advance_setup(&mut self) {
         self.st.setup_need_road = false;
         self.st.setup_idx += 1;
         if self.st.setup_idx >= self.st.setup_seq.len() {
+            self.record_openings();
             self.st.phase = Phase::PreRoll;
             self.st.current = 0;
             self.st.turn = 1;
@@ -577,7 +636,9 @@ impl Game {
             let lr = self.st.longest_road == Some(p);
             let la = self.st.largest_army == Some(p);
             let vpc = self.st.players[p as usize].vp_cards();
+            let pm = self.st.players[p as usize].port_mask;
             let m = &mut self.st.players[p as usize].metrics;
+            m.final_port_mask = pm;
             m.vp_final = vp;
             m.vp_from_cards = vpc;
             m.final_pips = pips;

@@ -61,6 +61,56 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Search for a stronger strategy by self-play.
+    Tune {
+        /// Starting point: a preset name, or `preset+key=value,...`.
+        #[arg(long, default_value = "balanced")]
+        base: String,
+        #[arg(long, default_value_t = 18)]
+        rounds: usize,
+        /// Mutations tried per round.
+        #[arg(long, default_value_t = 5)]
+        candidates: usize,
+        /// Games per candidate evaluation.
+        #[arg(long, default_value_t = 1800)]
+        eval_games: usize,
+        #[arg(long, default_value_t = 4)]
+        players: usize,
+        /// Standard errors above chance a candidate must clear.
+        #[arg(long, default_value_t = 1.0)]
+        sigma: f64,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+        /// Games for the final check against the preset field.
+        #[arg(long, default_value_t = 40000)]
+        validate: usize,
+        /// Opponents to tune against, comma separated. Default is copies of
+        /// the champion (self-play); naming a varied field instead optimises
+        /// for general strength.
+        #[arg(long, value_delimiter = ',')]
+        against: Option<Vec<String>>,
+    },
+    /// Value opening positions in pips, using randomised openings.
+    Placement {
+        #[arg(long, short = 'n', default_value_t = 40000)]
+        games: usize,
+        /// Strategy every player uses after the opening.
+        #[arg(long, default_value = "balanced")]
+        strategy: String,
+        #[arg(long, default_value_t = 4)]
+        players: usize,
+        #[arg(long, default_value_t = 0x9A1D)]
+        seed: u64,
+        #[arg(long, value_enum, default_value = "balanced")]
+        layout: LayoutArg,
+        /// Randomise port positions too, so port value is not tied to the
+        /// nine canonical slots.
+        #[arg(long)]
+        random_ports: bool,
+        /// Write one row per opening position here.
+        #[arg(long)]
+        jsonl: Option<String>,
+    },
     /// Run a batch of games and report.
     Run {
         /// Strategies, one per seat, comma separated.
@@ -136,6 +186,164 @@ fn main() {
             print_single(&rec);
         }
 
+        Cmd::Placement {
+            games,
+            strategy,
+            players,
+            seed,
+            layout,
+            random_ports,
+            jsonl,
+        } => {
+            let Some(st) = catan_sim::bots::Strategy::parse(&strategy) else {
+                eprintln!("error: cannot parse strategy '{strategy}'");
+                std::process::exit(2);
+            };
+            let mut game = GameConfig::default();
+            game.n_players = players;
+            game.layout = layout_of(layout);
+            game.random_ports = random_ports;
+            let pc = catan_sim::placement::PlacementConfig {
+                games,
+                strategy: st,
+                n_players: players,
+                seed,
+                game,
+            };
+            let t0 = std::time::Instant::now();
+            let recs = catan_sim::placement::run_records(&pc);
+            let mut rep = catan_sim::placement::analyse(
+                &recs,
+                catan_sim::placement::REALISTIC_MIN_PIPS,
+            );
+            rep.wide = Some(Box::new(catan_sim::placement::analyse(&recs, 0)));
+            rep.print();
+            if let Some(path) = &jsonl {
+                match catan_sim::placement::write_rows(path, &recs) {
+                    Ok(n) => println!("\nwrote {n} opening rows to {path}"),
+                    Err(e) => eprintln!("could not write {path}: {e}"),
+                }
+            }
+            println!(
+                "\n({} games in {:.1}s, post-opening strategy: {strategy})",
+                games,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+
+        Cmd::Tune {
+            base,
+            rounds,
+            candidates,
+            eval_games,
+            players,
+            sigma,
+            seed,
+            validate,
+            against,
+        } => {
+            let Some(w0) = catan_sim::bots::Weights::from_spec(&base) else {
+                eprintln!("error: cannot parse base strategy '{base}'");
+                std::process::exit(2);
+            };
+            let mut game = GameConfig::default();
+            game.n_players = players;
+            let tc = catan_sim::tune::TuneConfig {
+                rounds,
+                candidates,
+                games_per_eval: eval_games,
+                n_players: players,
+                seed,
+                game,
+                accept_sigma: sigma,
+                opponents: against
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|n| {
+                        catan_sim::bots::Strategy::parse(n)
+                            .unwrap_or_else(|| panic!("unknown strategy: {n}"))
+                    })
+                    .collect(),
+            };
+            let se = catan_sim::tune::diff_se(&tc);
+            println!("=== strategy search ===");
+            println!(
+                "base: {base} | {rounds} rounds x {} runs x {eval_games} games = {} games",
+                candidates + 1,
+                rounds * (candidates + 1) * eval_games
+            );
+            match &against {
+                Some(v) => println!("opponents: {} (fixed field)", v.join(", ")),
+                None => println!("opponents: copies of the champion (self-play)"),
+            }
+            println!(
+                "a candidate plays {players} ways; chance is {:.1}%",
+                100.0 / players as f64
+            );
+            println!(
+                "the champion is re-measured on the same seeds each round; promotion needs a \
+                 margin over it"
+            );
+            println!(
+                "of {sigma} SE, where SE of the difference is about {:.2}%\n",
+                100.0 * se
+            );
+            println!(
+                "{:<6} {:>8} {:>8} {:>8} {:>8}  {}",
+                "round", "champ%", "best%", "margin", "skill", "accepted change"
+            );
+            let t0 = std::time::Instant::now();
+            let res = catan_sim::tune::run(&tc, w0, |r, champ| {
+                let ch = if r.accepted {
+                    r.best
+                        .changes
+                        .iter()
+                        .map(|(k, a, b)| format!("{k} {a:.2}->{b:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    "-".to_string()
+                };
+                println!(
+                    "{:<6} {:>7.2}% {:>7.2}% {:>+7.2}% {:>8.3}  {}",
+                    r.round,
+                    100.0 * r.champion_win_rate,
+                    100.0 * r.best.win_rate,
+                    100.0 * r.margin,
+                    r.best.skill_index,
+                    ch
+                );
+                let _ = champ;
+            });
+            println!(
+                "\nsearch used {} games in {:.1}s",
+                res.games_used,
+                t0.elapsed().as_secs_f64()
+            );
+            println!("\nchampion weights:\n  {}", res.champion.to_spec());
+            println!(
+                "\nreproduce with:\n  catan_sim run --players \
+                 'TUNED:balanced+{}',city_builder,balanced,dev_rush",
+                res.champion.to_spec()
+            );
+
+            if validate > 0 {
+                println!("\n=== validation: champion against the preset field ===");
+                let mut lineup = vec![
+                    catan_sim::bots::Strategy::Heuristic(res.champion.clone())
+                        .relabel("TUNED"),
+                ];
+                for n in ["balanced", "city_builder", "dev_rush"] {
+                    lineup.push(catan_sim::bots::Strategy::parse(n).unwrap());
+                }
+                let mut vc = catan_sim::sim::SimConfig::with_strategies(lineup, validate);
+                vc.base_seed = seed ^ 0xABCDEF;
+                let recs = catan_sim::sim::run(&vc);
+                print_report(&vc, &analysis::summarize(&recs), t0.elapsed());
+            }
+        }
+
         Cmd::Run {
             players,
             games,
@@ -170,7 +378,10 @@ fn main() {
             };
             let cfg = SimConfig {
                 games,
-                lineup: players.clone(),
+                lineup: players
+                    .iter()
+                    .map(|s| catan_sim::bots::Strategy::parse(s).expect("checked above"))
+                    .collect(),
                 rotate_seats: !no_rotate,
                 base_seed: seed,
                 game,
@@ -277,7 +488,7 @@ fn print_report(cfg: &SimConfig, s: &Summary, dt: std::time::Duration) {
     );
     println!(
         "lineup: {} | seat rotation: {} | player trades: {} | dice: {:?} | layout: {:?}",
-        cfg.lineup.join(", "),
+        cfg.labels().join(", "),
         if cfg.rotate_seats { "on" } else { "OFF" },
         if cfg.game.allow_player_trades { "on" } else { "OFF" },
         cfg.game.dice,

@@ -98,6 +98,7 @@ output and the JSONL export are for.
 | `expander` | wood and brick, sprawls outward, chases longest road |
 | `trader` | leans on ports and trades with everyone |
 | `hermit` | identical to `balanced` but never trades with another player |
+| `tuned` | found by self-play search; the strongest strategy here |
 | `random` | uniform over legal actions; the null hypothesis |
 
 Every non-random bot shares one scoring engine and differs only by a weight
@@ -107,6 +108,71 @@ quality. To add a strategy, add a preset to `Weights::preset` — no engine code
 
 Bots see a `View`, not the game state. Opponents' hand contents and unplayed
 development cards are hidden, so a strategy cannot quietly win by cheating.
+
+## Searching for a better strategy
+
+```bash
+catan_sim tune --base balanced --rounds 20 --candidates 5 --eval-games 2000
+```
+
+A (1+lambda) hill climb. Each round mutates the champion's weights several
+ways and tests each variant. Two details make it trustworthy:
+
+- **The champion is re-measured every round.** Comparing candidates against a
+  fixed null of `1/n_players` is right in pure self-play by symmetry, but
+  wrong against a fixed field: if the champion already beats that field at
+  30%, a 26% bar promotes everything and the search becomes a random walk
+  selecting on noise. (This bug cost one 180k-game run here.)
+- **Common random numbers.** The champion and every candidate in a round play
+  the same seeds, so they face the same boards and the same dice. They share
+  the luck, and the variance of the *difference* is much smaller than the
+  variance of either alone.
+
+`--against a,b,c` tunes against a fixed field instead of self-play. Self-play
+is the safer objective; a fixed field can be exploited rather than beaten in
+general, so validate the result against a field it was *not* tuned on.
+
+The `tuned` preset came out of this: ~440k games of search, and it beats every
+hand-written preset (28.1% against three `city_builder`s, 30.6% against three
+`balanced`, where chance is 25%). Its character versus `balanced`: trade much
+more readily (+125% offer rate, −44% acceptance threshold) while guarding the
+leader more (+28%), favour grain and ore over wood and brick, buy 29% fewer
+development cards, and weight single-intersection resource diversity 59% less.
+
+## Valuing opening positions in pips
+
+```bash
+catan_sim placement -n 60000 --strategy tuned --jsonl openings.jsonl
+```
+
+Everything about a starting position is priced in **adjusted pips**: one
+adjusted pip is the value of one pip of average production, so "a 3:1 port is
+worth 1.9 adjusted pips" means it is worth as much as 1.9 extra pips of
+production.
+
+The design point: in a normal game bots *choose* where to start, so opening
+position is entangled with strategy and the estimates would be confounded. So
+every player places uniformly at random and then plays the same strategy.
+Position becomes exogenous and the coefficients can be read as the value of
+the ground.
+
+Two calibration traps this handles:
+
+- Random openings average about 13 pips against 19-20 for chosen ones, and the
+  value of a pip *falls* as pips accumulate (the squared term is strongly
+  significant). Fitting over the whole range would calibrate the pip unit on
+  positions nobody plays. The headline fit is therefore restricted to openings
+  of 14+ pips, with the full-range fit printed alongside for comparison.
+- Port intersections sit on the coast and so touch fewer hexes, making port
+  access negatively correlated with raw pips. Controlling for pips by resource
+  is what separates "this port is valuable" from "port spots are weak spots" —
+  and it is why ports look bad in a naive comparison.
+
+Results are checked against a second model on win probability rather than
+victory points, against randomised port positions, and against a different
+subject strategy. **Placement values turn out to be strategy-dependent** — ore
+is worth 1.05 adjusted pips to `tuned` but 1.48 to `balanced`, which buys more
+development cards — so quote them with the strategy attached.
 
 ## Running experiments
 
@@ -134,6 +200,12 @@ catan_sim run --players balanced,dev_rush,expander -n 20000 --vp 8
 catan_sim one --seed 42
 catan_sim board --seed 7
 ```
+
+Strategies can be given as `preset+key=value;key=value` to override weights,
+and `label:preset+...` to name a variant so two variants of one preset are not
+pooled under the base name in the report. `catan_sim list` shows the presets;
+overrides are clamped to sane bounds and a typo is an error rather than a
+silent fallback.
 
 Useful flags: `--seed`, `--no-rotate` (to *measure* seat advantage rather than
 cancel it), `--hand-limit`, `--json summary.json`, and `--jsonl rows.jsonl`

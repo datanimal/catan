@@ -15,8 +15,9 @@ use crate::policy::{Policy, View};
 use crate::types::*;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Weights {
     pub label: String,
     /// Base appetite for each build.
@@ -46,6 +47,141 @@ pub struct Weights {
     pub leader_wariness: f64,
     /// Random jitter added to every score, to break ties and decorrelate.
     pub noise: f64,
+    /// Place the opening settlements uniformly at random among the legal
+    /// intersections, while playing normally afterwards. Used to get
+    /// *exogenous* variation in opening position: when a bot chooses where to
+    /// start, its placement is entangled with its strategy and the two cannot
+    /// be told apart. Randomising it breaks that link.
+    pub random_opening: bool,
+}
+
+/// The tunable parameters, as a flat list for search.
+pub const PARAM_KEYS: [&str; 17] = [
+    "w_city",
+    "w_settlement",
+    "w_road",
+    "w_dev",
+    "pref_brick",
+    "pref_lumber",
+    "pref_wool",
+    "pref_grain",
+    "pref_ore",
+    "diversity",
+    "port",
+    "knight_eagerness",
+    "longest_road_drive",
+    "bank_trade_drive",
+    "propose_drive",
+    "accept_floor",
+    "leader_wariness",
+];
+
+/// Plausible bounds for each parameter, so a search cannot wander into
+/// nonsense.
+pub fn param_bounds(key: &str) -> (f64, f64) {
+    match key {
+        "w_city" | "w_settlement" => (5.0, 120.0),
+        "w_road" => (0.0, 60.0),
+        "w_dev" => (0.0, 90.0),
+        "pref_brick" | "pref_lumber" | "pref_wool" | "pref_grain" | "pref_ore" => (0.2, 3.0),
+        "diversity" => (0.0, 15.0),
+        "port" => (0.0, 20.0),
+        "knight_eagerness" => (0.0, 40.0),
+        "longest_road_drive" => (0.0, 10.0),
+        "bank_trade_drive" | "propose_drive" => (0.0, 6.0),
+        "accept_floor" => (-3.0, 4.0),
+        "leader_wariness" => (0.0, 10.0),
+        _ => (0.0, 1.0),
+    }
+}
+
+impl Weights {
+    pub fn get(&self, key: &str) -> f64 {
+        use Resource::*;
+        match key {
+            "w_city" => self.w_city,
+            "w_settlement" => self.w_settlement,
+            "w_road" => self.w_road,
+            "w_dev" => self.w_dev,
+            "pref_brick" => self.res_pref[Brick.idx()],
+            "pref_lumber" => self.res_pref[Lumber.idx()],
+            "pref_wool" => self.res_pref[Wool.idx()],
+            "pref_grain" => self.res_pref[Grain.idx()],
+            "pref_ore" => self.res_pref[Ore.idx()],
+            "diversity" => self.diversity,
+            "port" => self.port,
+            "knight_eagerness" => self.knight_eagerness,
+            "longest_road_drive" => self.longest_road_drive,
+            "bank_trade_drive" => self.bank_trade_drive,
+            "propose_drive" => self.propose_drive,
+            "accept_floor" => self.accept_floor,
+            "leader_wariness" => self.leader_wariness,
+            other => panic!("unknown weight '{other}'"),
+        }
+    }
+
+    pub fn set(&mut self, key: &str, v: f64) {
+        use Resource::*;
+        let (lo, hi) = param_bounds(key);
+        let v = v.clamp(lo, hi);
+        match key {
+            "w_city" => self.w_city = v,
+            "w_settlement" => self.w_settlement = v,
+            "w_road" => self.w_road = v,
+            "w_dev" => self.w_dev = v,
+            "pref_brick" => self.res_pref[Brick.idx()] = v,
+            "pref_lumber" => self.res_pref[Lumber.idx()] = v,
+            "pref_wool" => self.res_pref[Wool.idx()] = v,
+            "pref_grain" => self.res_pref[Grain.idx()] = v,
+            "pref_ore" => self.res_pref[Ore.idx()] = v,
+            "diversity" => self.diversity = v,
+            "port" => self.port = v,
+            "knight_eagerness" => self.knight_eagerness = v,
+            "longest_road_drive" => self.longest_road_drive = v,
+            "bank_trade_drive" => self.bank_trade_drive = v,
+            "propose_drive" => self.propose_drive = v,
+            "accept_floor" => self.accept_floor = v,
+            "leader_wariness" => self.leader_wariness = v,
+            other => panic!("unknown weight '{other}'"),
+        }
+    }
+
+    /// Compact `key=value` form, for logging a tuned strategy.
+    ///
+    /// Overrides are separated by `;`, not `,`, so that a whole spec survives
+    /// being passed inside a comma-separated list of players.
+    pub fn to_spec(&self) -> String {
+        PARAM_KEYS
+            .iter()
+            .map(|k| format!("{k}={:.3}", self.get(k)))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Parse `base+key=value;key=value`, e.g. `balanced+w_dev=40;port=9`.
+    /// Commas are also accepted for a spec given on its own.
+    pub fn from_spec(spec: &str) -> Option<Weights> {
+        let (base, rest) = match spec.split_once('+') {
+            Some((b, r)) => (b, Some(r)),
+            None => (spec, None),
+        };
+        let mut w = Weights::preset(base)?;
+        if let Some(rest) = rest {
+            for kv in rest
+                .split([';', ','])
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let (k, v) = kv.split_once('=')?;
+                let v: f64 = v.trim().parse().ok()?;
+                if !PARAM_KEYS.contains(&k.trim()) {
+                    return None;
+                }
+                w.set(k.trim(), v);
+            }
+        }
+        Some(w)
+    }
 }
 
 impl Default for Weights {
@@ -67,6 +203,7 @@ impl Default for Weights {
             accepts_trades: true,
             leader_wariness: 3.0,
             noise: 0.75,
+            random_opening: false,
         }
     }
 }
@@ -77,6 +214,33 @@ impl Weights {
         let mut w = Weights::default();
         match name {
             "balanced" => {}
+            // Found by self-play search (`catan_sim tune`), starting from
+            // `balanced`, over about 440k games. It beats every preset here:
+            // 28.1% against three city_builders and 30.6% against three
+            // balanced, where chance is 25%. Its character: trade far more
+            // readily but guard the leader, favour grain and ore over wood and
+            // brick, buy fewer development cards, and weight raw numbers over
+            // spreading across resources at a single intersection.
+            "tuned" => {
+                w.label = "tuned".into();
+                w.w_city = 54.88;
+                w.w_settlement = 55.41;
+                w.w_road = 6.33;
+                w.w_dev = 12.70;
+                w.res_pref[Brick.idx()] = 0.861;
+                w.res_pref[Lumber.idx()] = 0.750;
+                w.res_pref[Wool.idx()] = 1.005;
+                w.res_pref[Grain.idx()] = 1.243;
+                w.res_pref[Ore.idx()] = 1.105;
+                w.diversity = 1.032;
+                w.port = 3.000;
+                w.knight_eagerness = 6.024;
+                w.longest_road_drive = 1.207;
+                w.bank_trade_drive = 1.194;
+                w.propose_drive = 2.248;
+                w.accept_floor = 0.279;
+                w.leader_wariness = 3.835;
+            }
             // Ore and grain, straight to cities. Few roads.
             "city_builder" => {
                 w.label = "city_builder".into();
@@ -140,6 +304,7 @@ impl Weights {
 
     pub fn all_presets() -> Vec<&'static str> {
         vec![
+            "tuned",
             "balanced",
             "city_builder",
             "dev_rush",
@@ -482,6 +647,13 @@ impl Policy for HeuristicBot {
     }
 
     fn choose(&mut self, v: &View, actions: &[Action]) -> usize {
+        // Exogenous opening: pick uniformly among the legal intersections so
+        // that opening position is uncorrelated with everything else.
+        if self.w.random_opening
+            && matches!(actions[0], Action::PlaceInitialSettlement(_))
+        {
+            return self.rng.random_range(0..actions.len());
+        }
         let mut best = 0usize;
         let mut best_s = f64::MIN;
         for (i, a) in actions.iter().enumerate() {
@@ -574,12 +746,84 @@ impl Policy for HeuristicBot {
 
 // ---------------------------------------------------------------- factory ----
 
-/// Build a policy by name. `seed` decorrelates each seat's tie-breaking.
-pub fn make(name: &str, seed: u64) -> Option<Box<dyn Policy>> {
-    if name == "random" {
-        return Some(Box::new(RandomBot::new(seed)));
+/// A seat's strategy: either the random baseline or a weight vector.
+#[derive(Clone, Debug)]
+pub enum Strategy {
+    Random,
+    Heuristic(Weights),
+}
+
+impl Strategy {
+    /// Parse a preset name, `preset+key=value,...` to override weights, or
+    /// `label:preset+...` to also give it a distinct name in reports.
+    ///
+    /// The label matters: two tuned variants of the same preset would
+    /// otherwise both report as "balanced" and be pooled together, hiding the
+    /// very comparison being run.
+    pub fn parse(spec: &str) -> Option<Strategy> {
+        // A label is everything before the first ':' -- but only when what
+        // follows still parses, so a bare name is never mistaken for one.
+        if let Some((label, rest)) = spec.split_once(':') {
+            if let Some(st) = Strategy::parse_inner(rest) {
+                return Some(st.relabel(label));
+            }
+        }
+        Strategy::parse_inner(spec)
     }
-    Weights::preset(name).map(|w| Box::new(HeuristicBot::new(w, seed)) as Box<dyn Policy>)
+
+    fn parse_inner(spec: &str) -> Option<Strategy> {
+        if spec == "random" {
+            return Some(Strategy::Random);
+        }
+        Weights::from_spec(spec).map(Strategy::Heuristic)
+    }
+
+    /// The name this strategy is reported under.
+    pub fn label(&self) -> String {
+        match self {
+            Strategy::Random => "random".into(),
+            Strategy::Heuristic(w) => w.label.clone(),
+        }
+    }
+
+    pub fn relabel(mut self, label: &str) -> Strategy {
+        if let Strategy::Heuristic(w) = &mut self {
+            w.label = label.to_string();
+        }
+        self
+    }
+
+    /// True when this is the plain random baseline, which cannot be relabelled.
+    pub fn is_random(&self) -> bool {
+        matches!(self, Strategy::Random)
+    }
+
+    /// Place the opening settlements at random, for placement experiments.
+    pub fn with_random_opening(mut self) -> Strategy {
+        if let Strategy::Heuristic(w) = &mut self {
+            w.random_opening = true;
+        }
+        self
+    }
+
+    pub fn weights(&self) -> Option<&Weights> {
+        match self {
+            Strategy::Heuristic(w) => Some(w),
+            Strategy::Random => None,
+        }
+    }
+
+    pub fn make(&self, seed: u64) -> Box<dyn Policy> {
+        match self {
+            Strategy::Random => Box::new(RandomBot::new(seed)),
+            Strategy::Heuristic(w) => Box::new(HeuristicBot::new(w.clone(), seed)),
+        }
+    }
+}
+
+/// Build a policy from a preset name or weight spec.
+pub fn make(spec: &str, seed: u64) -> Option<Box<dyn Policy>> {
+    Strategy::parse(spec).map(|s| s.make(seed))
 }
 
 /// Every strategy name the simulator knows.

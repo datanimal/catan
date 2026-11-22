@@ -515,3 +515,166 @@ pub fn summarize(records: &[GameRecord]) -> Summary {
         roll_histogram: hist,
     }
 }
+
+// ------------------------------------------------------------------ OLS ----
+
+/// Ordinary least squares with standard errors, for valuing board features.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Ols {
+    pub names: Vec<String>,
+    pub intercept: f64,
+    pub coef: Vec<f64>,
+    pub se: Vec<f64>,
+    pub n: usize,
+    pub r2: f64,
+    /// Residual standard deviation of the outcome.
+    pub resid_sd: f64,
+    /// Mean of each regressor, for evaluating effects at typical values.
+    pub means: Vec<f64>,
+    /// Covariance matrix of the coefficients. Needed to put an interval on a
+    /// combination of them, such as "the value of a 2:1 port at 6 pips of
+    /// that resource", which mixes a main effect with an interaction.
+    pub cov: Vec<Vec<f64>>,
+}
+
+impl Ols {
+    pub fn t(&self, i: usize) -> f64 {
+        if self.se[i] > 0.0 {
+            self.coef[i] / self.se[i]
+        } else {
+            0.0
+        }
+    }
+    /// 95% interval for coefficient `i`.
+    pub fn ci(&self, i: usize) -> (f64, f64) {
+        (
+            self.coef[i] - 1.96 * self.se[i],
+            self.coef[i] + 1.96 * self.se[i],
+        )
+    }
+    pub fn by_name(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+    pub fn coef_of(&self, name: &str) -> f64 {
+        self.by_name(name).map(|i| self.coef[i]).unwrap_or(0.0)
+    }
+
+    /// Value of a linear combination of coefficients, with its standard
+    /// error: `sum(w_i * beta_i)` and `sqrt(w' Cov w)`.
+    pub fn combo(&self, terms: &[(&str, f64)]) -> (f64, f64) {
+        let idx: Vec<(usize, f64)> = terms
+            .iter()
+            .filter_map(|(n, w)| self.by_name(n).map(|i| (i, *w)))
+            .collect();
+        let val: f64 = idx.iter().map(|(i, w)| w * self.coef[*i]).sum();
+        let mut var = 0.0;
+        for &(i, wi) in &idx {
+            for &(j, wj) in &idx {
+                var += wi * wj * self.cov[i][j];
+            }
+        }
+        (val, var.max(0.0).sqrt())
+    }
+    pub fn se_of(&self, name: &str) -> f64 {
+        self.by_name(name).map(|i| self.se[i]).unwrap_or(0.0)
+    }
+}
+
+/// Invert a square matrix by Gauss-Jordan elimination.
+fn invert(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = m.len();
+    let mut a: Vec<Vec<f64>> = m
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut r = row.clone();
+            r.extend((0..n).map(|j| if i == j { 1.0 } else { 0.0 }));
+            r
+        })
+        .collect();
+    for col in 0..n {
+        let piv = (col..n).max_by(|&i, &j| {
+            a[i][col].abs().partial_cmp(&a[j][col].abs()).unwrap()
+        })?;
+        if a[piv][col].abs() < 1e-10 {
+            return None;
+        }
+        a.swap(col, piv);
+        let d = a[col][col];
+        for k in 0..2 * n {
+            a[col][k] /= d;
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let f = a[row][col];
+            if f == 0.0 {
+                continue;
+            }
+            for k in 0..2 * n {
+                a[row][k] -= f * a[col][k];
+            }
+        }
+    }
+    Some(a.into_iter().map(|r| r[n..].to_vec()).collect())
+}
+
+/// Fit `y ~ 1 + x` by least squares. `x` is row-major: one Vec per
+/// observation, each of length `names.len()`.
+pub fn ols(names: &[String], x: &[Vec<f64>], y: &[f64]) -> Option<Ols> {
+    let n = y.len();
+    let k = names.len();
+    if n <= k + 2 {
+        return None;
+    }
+    // Centre the regressors, so the normal equations stay well conditioned
+    // and the intercept drops out of the system.
+    let means: Vec<f64> = (0..k)
+        .map(|j| x.iter().map(|r| r[j]).sum::<f64>() / n as f64)
+        .collect();
+    let ybar = y.iter().sum::<f64>() / n as f64;
+
+    let mut xtx = vec![vec![0.0f64; k]; k];
+    let mut xty = vec![0.0f64; k];
+    for (row, &yi) in x.iter().zip(y.iter()) {
+        let c: Vec<f64> = (0..k).map(|j| row[j] - means[j]).collect();
+        let yc = yi - ybar;
+        for i in 0..k {
+            xty[i] += c[i] * yc;
+            for j in 0..k {
+                xtx[i][j] += c[i] * c[j];
+            }
+        }
+    }
+    let inv = invert(&xtx)?;
+    let coef: Vec<f64> = (0..k)
+        .map(|i| (0..k).map(|j| inv[i][j] * xty[j]).sum())
+        .collect();
+
+    let mut sse = 0.0;
+    let mut sst = 0.0;
+    for (row, &yi) in x.iter().zip(y.iter()) {
+        let pred: f64 = ybar
+            + (0..k).map(|j| coef[j] * (row[j] - means[j])).sum::<f64>();
+        sse += (yi - pred).powi(2);
+        sst += (yi - ybar).powi(2);
+    }
+    let dof = (n - k - 1) as f64;
+    let s2 = sse / dof;
+    let se: Vec<f64> = (0..k).map(|i| (s2 * inv[i][i]).max(0.0).sqrt()).collect();
+
+    Some(Ols {
+        names: names.to_vec(),
+        intercept: ybar - (0..k).map(|j| coef[j] * means[j]).sum::<f64>(),
+        coef,
+        se,
+        n,
+        r2: if sst > 0.0 { 1.0 - sse / sst } else { 0.0 },
+        resid_sd: s2.sqrt(),
+        means,
+        cov: (0..k)
+            .map(|i| (0..k).map(|j| s2 * inv[i][j]).collect())
+            .collect(),
+    })
+}

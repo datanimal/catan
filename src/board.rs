@@ -402,6 +402,61 @@ impl Board {
     }
 }
 
+impl Board {
+    /// Pips broken down by resource *and* number token for a set of nodes.
+    /// Indexed `[resource][number]`. Used to detect income that arrives
+    /// together: a brick hex and a lumber hex on the same number pay out
+    /// simultaneously, which is a different proposition from the same pips
+    /// spread over two numbers.
+    pub fn pips_by_res_number(&self, nodes: &[u8]) -> [[u32; 13]; N_RES] {
+        let mut out = [[0u32; 13]; N_RES];
+        let topo = topology();
+        for &n in nodes {
+            for &h in topo.node_hexes[n as usize].iter() {
+                if let Some(r) = self.hex_resource(h) {
+                    let num = self.numbers[h as usize] as usize;
+                    if num >= 2 && num <= 12 {
+                        out[r.idx()][num] += pips(self.numbers[h as usize]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Pips of `a` and `b` that arrive on the same number token, i.e. the
+    /// portion of the two incomes that is perfectly correlated.
+    pub fn paired_pips(&self, nodes: &[u8], a: Resource, b: Resource) -> u32 {
+        let t = self.pips_by_res_number(nodes);
+        (2..=12).map(|n| t[a.idx()][n].min(t[b.idx()][n])).sum()
+    }
+
+    /// Roads needed to reach the nearest node carrying a port that matches
+    /// `want`, starting from any node in `from`. 0 means already on one.
+    /// Returns `None` if no such port exists on this board.
+    pub fn port_distance(&self, from: &[u8], want: impl Fn(u8) -> bool) -> Option<u8> {
+        let topo = topology();
+        let mut dist = vec![u8::MAX; N_NODES];
+        let mut queue: std::collections::VecDeque<u8> = Default::default();
+        for &n in from {
+            dist[n as usize] = 0;
+            queue.push_back(n);
+        }
+        while let Some(n) = queue.pop_front() {
+            if want(self.node_port_mask[n as usize]) {
+                return Some(dist[n as usize]);
+            }
+            for &nb in topo.node_neighbors[n as usize].iter() {
+                if dist[nb as usize] == u8::MAX {
+                    dist[nb as usize] = dist[n as usize] + 1;
+                    queue.push_back(nb);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Pairs of adjacent hex indices (sharing an edge).
 pub fn hex_adjacencies() -> Vec<(usize, usize)> {
     static CACHE: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
