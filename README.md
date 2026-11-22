@@ -177,6 +177,13 @@ field, and the heuristic bots beat random play.
   shared scoring engine is what makes the comparison fair.
 - The robber heuristic targets the leader, which is realistic, but means
   `theft_luck` is partly a consequence of playing well.
+- **`--layout standard` is a single board, not a sample of boards.** Every
+  game uses the identical fixed layout, so the only variation is the dice and
+  bot tie-breaking. Confidence intervals from such a run describe *that one
+  board* and are far too tight to generalise — and the strategy ranking really
+  does change from board to board (on the rulebook layout `dev_rush` wins 33%
+  and `expander` 11%; on random balanced boards they are 22% and 19%). Use
+  `--layout random` or `balanced` for any claim about strategies in general.
 - Port positions use the real board's 2-1-2-1-2-1 frame pattern; the exact
   resource assigned to each slot is a documented choice, not looked up from the
   physical board. Use `--random-ports` if that matters to a conclusion.
