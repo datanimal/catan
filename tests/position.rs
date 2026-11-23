@@ -5,7 +5,7 @@
 use catan_sim::bots;
 use catan_sim::game::{Game, GameConfig};
 use catan_sim::invariants;
-use catan_sim::position::Position;
+use catan_sim::position::{Position, Ref};
 use catan_sim::state::Phase;
 
 fn mid_game(seed: u64, until_vp: u8) -> catan_sim::state::GameState {
@@ -79,19 +79,23 @@ fn impossible_positions_are_rejected() {
 
     // Two buildings on the same intersection.
     let mut p = good.clone();
-    let n = p.players[1].settlements[0];
-    p.players[0].settlements.push(n);
+    let n = p.players[1].settlements[0].node().unwrap();
+    p.players[0].settlements.push(Ref::Index(n));
     assert!(p.to_state().is_err(), "a double-occupied intersection was accepted");
 
     // Buildings on adjacent intersections, which the distance rule forbids.
     let mut p = good.clone();
     let topo = catan_sim::board::topology();
-    let occupied = p.players[0].settlements[0];
+    let occupied = p.players[0].settlements[0].node().unwrap();
     let neighbour = topo.node_neighbors[occupied as usize][0];
-    if p.players.iter().all(|pl| {
-        !pl.settlements.contains(&neighbour) && !pl.cities.contains(&neighbour)
-    }) {
-        p.players[0].settlements.push(neighbour);
+    let taken = |pl: &catan_sim::position::PlayerPos| {
+        pl.settlements
+            .iter()
+            .chain(pl.cities.iter())
+            .any(|r| r.node().ok() == Some(neighbour))
+    };
+    if p.players.iter().all(|pl| !taken(pl)) {
+        p.players[0].settlements.push(Ref::Index(neighbour));
         assert!(
             p.to_state().is_err(),
             "a distance-rule violation was accepted"
@@ -109,7 +113,7 @@ fn impossible_positions_are_rejected() {
     assert!(p.to_state().is_err(), "an unknown terrain was accepted");
 
     let mut p = good.clone();
-    p.players[0].roads.push(200);
+    p.players[0].roads.push(Ref::Index(200));
     assert!(p.to_state().is_err(), "a path that does not exist was accepted");
 
     let mut p = good.clone();
@@ -118,7 +122,7 @@ fn impossible_positions_are_rejected() {
 
     // Too many pieces.
     let mut p = good.clone();
-    p.players[0].cities = (0..6).collect();
+    p.players[0].cities = (0..6).map(Ref::Index).collect();
     assert!(p.to_state().is_err(), "six cities were accepted");
 
     // And the untouched original must still be fine.

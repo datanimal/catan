@@ -33,7 +33,80 @@ pub struct BoardSpec {
     /// Ports as `(kind, edge)`, kind being a resource name or "any".
     /// Omit to use the standard arrangement.
     #[serde(default)]
-    pub ports: Option<Vec<(String, u8)>>,
+    pub ports: Option<Vec<(String, Ref)>>,
+}
+
+/// An intersection, written either as a raw index or, far more usefully for
+/// transcribing from a picture, as `"<hex>:<corner>"` such as `"7:N"`.
+///
+/// Corners are N, NE, SE, S, SW, NW and sides are NE, E, SE, SW, W, NW, with
+/// hexes numbered 0-18 in rows of 3/4/5/4/3 from the top. Because neighbouring
+/// hexes share corners, the same intersection has up to three names; any of
+/// them is accepted, and `catan_sim key` prints the board with its hex numbers
+/// so a screenshot can be read off directly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Ref {
+    Index(u8),
+    Named(String),
+}
+
+impl Ref {
+    pub fn node(&self) -> Result<u8, String> {
+        match self {
+            Ref::Index(i) if (*i as usize) < N_NODES => Ok(*i),
+            Ref::Index(i) => Err(format!("intersection {i} does not exist")),
+            Ref::Named(s) => {
+                let (h, c) = s
+                    .split_once(':')
+                    .ok_or_else(|| format!("'{s}' is not <hex>:<corner>, e.g. 7:N"))?;
+                let hex: u8 = h
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("'{h}' is not a hex number"))?;
+                if hex as usize >= N_HEXES {
+                    return Err(format!(
+                        "'{s}' names hex {hex}, but the board has hexes 0-{}",
+                        N_HEXES - 1
+                    ));
+                }
+                crate::board::corner_node(hex, c.trim()).ok_or_else(|| {
+                    format!("'{s}' is not a corner; use one of {:?}", crate::board::CORNER_NAMES)
+                })
+            }
+        }
+    }
+    pub fn edge(&self) -> Result<u8, String> {
+        match self {
+            Ref::Index(i) if (*i as usize) < N_EDGES => Ok(*i),
+            Ref::Index(i) => Err(format!("path {i} does not exist")),
+            Ref::Named(s) => {
+                let (h, c) = s
+                    .split_once(':')
+                    .ok_or_else(|| format!("'{s}' is not <hex>:<side>, e.g. 7:NW"))?;
+                let hex: u8 = h
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("'{h}' is not a hex number"))?;
+                if hex as usize >= N_HEXES {
+                    return Err(format!(
+                        "'{s}' names hex {hex}, but the board has hexes 0-{}",
+                        N_HEXES - 1
+                    ));
+                }
+                crate::board::side_edge(hex, c.trim()).ok_or_else(|| {
+                    format!("'{s}' is not a side; use one of {:?}", crate::board::SIDE_NAMES)
+                })
+            }
+        }
+    }
+}
+
+fn resolve_nodes(v: &[Ref]) -> Result<Vec<u8>, String> {
+    v.iter().map(|r| r.node()).collect()
+}
+fn resolve_edges(v: &[Ref]) -> Result<Vec<u8>, String> {
+    v.iter().map(|r| r.edge()).collect()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42,13 +115,13 @@ pub struct PlayerPos {
     pub name: String,
     /// Intersections holding a settlement.
     #[serde(default)]
-    pub settlements: Vec<u8>,
+    pub settlements: Vec<Ref>,
     /// Intersections holding a city.
     #[serde(default)]
-    pub cities: Vec<u8>,
+    pub cities: Vec<Ref>,
     /// Paths holding a road.
     #[serde(default)]
-    pub roads: Vec<u8>,
+    pub roads: Vec<Ref>,
     /// Resource cards, as `{"brick": 2, "ore": 1}`. Unknown hands may be left
     /// out, in which case `hand_size` is used and the mix is guessed.
     #[serde(default)]
@@ -92,6 +165,21 @@ pub struct Position {
 
 fn default_target() -> u8 {
     10
+}
+
+/// The name a node is written out as: the lowest-numbered hex that touches it.
+fn canonical_node(n: u8) -> String {
+    crate::board::node_names(n)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| n.to_string())
+}
+
+fn canonical_edge(e: u8) -> String {
+    crate::board::edge_names(e)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| e.to_string())
 }
 
 fn parse_terrain(s: &str) -> Result<Terrain, String> {
@@ -155,10 +243,8 @@ impl Position {
             let topo = topology();
             board.ports.clear();
             board.node_port_mask = vec![0u8; N_NODES];
-            for (kind, edge) in ports {
-                if *edge as usize >= N_EDGES {
-                    return Err(format!("port on path {edge}, which does not exist"));
-                }
+            for (kind, edge_ref) in ports {
+                let edge = edge_ref.edge()?;
                 let k = if kind.eq_ignore_ascii_case("any") || kind == "3:1" {
                     PortKind::Generic
                 } else {
@@ -168,10 +254,10 @@ impl Position {
                     PortKind::Generic => 1u8 << 5,
                     PortKind::Specific(r) => 1u8 << r.idx(),
                 };
-                for &n in topo.edge_nodes[*edge as usize].iter() {
+                for &n in topo.edge_nodes[edge as usize].iter() {
                     board.node_port_mask[n as usize] |= bit;
                 }
-                board.ports.push(crate::board::Port { kind: k, edge: *edge });
+                board.ports.push(crate::board::Port { kind: k, edge });
             }
         }
         // Rebuild the roll table and place the robber.
@@ -204,12 +290,11 @@ impl Position {
 
         for (pi, p) in self.players.iter().enumerate() {
             let owner = pi as u8;
-            for &n in p.settlements.iter().chain(p.cities.iter()) {
-                if n as usize >= N_NODES {
-                    return Err(format!("intersection {n} does not exist"));
-                }
-            }
-            for &n in &p.settlements {
+            let settlements = resolve_nodes(&p.settlements)
+                .map_err(|e| format!("player {pi}: {e}"))?;
+            let cities = resolve_nodes(&p.cities).map_err(|e| format!("player {pi}: {e}"))?;
+            let roads = resolve_edges(&p.roads).map_err(|e| format!("player {pi}: {e}"))?;
+            for &n in &settlements {
                 if st.node[n as usize].is_some() {
                     return Err(format!("two buildings on intersection {n}"));
                 }
@@ -218,7 +303,7 @@ impl Position {
                     building: Building::Settlement,
                 });
             }
-            for &n in &p.cities {
+            for &n in &cities {
                 if st.node[n as usize].is_some() {
                     return Err(format!("two buildings on intersection {n}"));
                 }
@@ -227,10 +312,7 @@ impl Position {
                     building: Building::City,
                 });
             }
-            for &e in &p.roads {
-                if e as usize >= N_EDGES {
-                    return Err(format!("path {e} does not exist"));
-                }
+            for &e in &roads {
                 if st.edge[e as usize].is_some() {
                     return Err(format!("two roads on path {e}"));
                 }
@@ -238,13 +320,13 @@ impl Position {
             }
             let pl = &mut st.players[pi];
             pl.settlements_left = MAX_SETTLEMENTS
-                .checked_sub(p.settlements.len() as u8)
+                .checked_sub(settlements.len() as u8)
                 .ok_or_else(|| format!("player {pi} has more than {MAX_SETTLEMENTS} settlements"))?;
             pl.cities_left = MAX_CITIES
-                .checked_sub(p.cities.len() as u8)
+                .checked_sub(cities.len() as u8)
                 .ok_or_else(|| format!("player {pi} has more than {MAX_CITIES} cities"))?;
             pl.roads_left = MAX_ROADS
-                .checked_sub(p.roads.len() as u8)
+                .checked_sub(roads.len() as u8)
                 .ok_or_else(|| format!("player {pi} has more than {MAX_ROADS} roads"))?;
             pl.knights_played = p.knights_played;
 
@@ -354,6 +436,94 @@ impl Position {
         Ok(st)
     }
 
+    /// Check the position against the standard board's fixed recipe.
+    ///
+    /// This is the safety net for a transcribed board. A standard game has
+    /// exactly 4 forest, 4 pasture, 4 fields, 3 hills, 3 mountains and 1
+    /// desert, and one specific multiset of number tokens. Misreading a 6 as
+    /// an 8, or a pasture as a field, breaks the recipe and is caught here --
+    /// which matters because `to_state` only rejects positions that are
+    /// *illegal*, and a misreading is usually perfectly legal and simply
+    /// wrong. A confident number computed from the wrong board is the worst
+    /// outcome, so these are reported loudly rather than silently tolerated.
+    ///
+    /// They are warnings, not errors: variants and expansions legitimately
+    /// use other mixes.
+    pub fn check_composition(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let parsed: Vec<Terrain> = self
+            .board
+            .terrain
+            .iter()
+            .filter_map(|t| parse_terrain(t).ok())
+            .collect();
+        if parsed.len() == N_HEXES {
+            let count = |t: Terrain| parsed.iter().filter(|&&x| x == t).count();
+            for (t, want, name) in [
+                (Terrain::Forest, 4, "forest"),
+                (Terrain::Pasture, 4, "pasture"),
+                (Terrain::Fields, 4, "fields"),
+                (Terrain::Hills, 3, "hills"),
+                (Terrain::Mountains, 3, "mountains"),
+                (Terrain::Desert, 1, "desert"),
+            ] {
+                let got = count(t);
+                if got != want {
+                    out.push(format!(
+                        "{got} {name} hexes, but a standard board has {want} -- check the board \
+                         was read correctly"
+                    ));
+                }
+            }
+        }
+        let mut nums: Vec<u8> = self.board.numbers.iter().copied().filter(|&n| n > 0).collect();
+        nums.sort_unstable();
+        let want = standard_numbers();
+        if nums != want {
+            // Say precisely which tokens are wrong, since that points at the
+            // hex that was misread.
+            let mut missing = want.clone();
+            for n in &nums {
+                if let Some(i) = missing.iter().position(|m| m == n) {
+                    missing.remove(i);
+                }
+            }
+            let mut extra = nums.clone();
+            for n in &want {
+                if let Some(i) = extra.iter().position(|m| m == n) {
+                    extra.remove(i);
+                }
+            }
+            out.push(format!(
+                "number tokens do not match a standard board: {} too many, {} missing",
+                if extra.is_empty() { "none".into() } else { format!("{extra:?}") },
+                if missing.is_empty() { "none".into() } else { format!("{missing:?}") },
+            ));
+        }
+        if let Some(ports) = &self.board.ports {
+            if ports.len() != 9 {
+                out.push(format!("{} ports, but a standard board has 9", ports.len()));
+            }
+        }
+        // A settlement named by two different hexes that disagree would have
+        // been caught on resolution; a duplicated intersection would not.
+        let mut all = Vec::new();
+        for p in &self.players {
+            for r in p.settlements.iter().chain(p.cities.iter()) {
+                if let Ok(n) = r.node() {
+                    all.push(n);
+                }
+            }
+        }
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        if all.len() != before {
+            out.push("the same intersection is listed more than once".into());
+        }
+        out
+    }
+
     /// Read a position from a JSON file.
     pub fn load(path: &str) -> Result<Position, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -388,7 +558,7 @@ impl Position {
                     PortKind::Generic => "any".to_string(),
                     PortKind::Specific(r) => r.name().to_string(),
                 };
-                (k, p.edge)
+                (k, Ref::Named(canonical_edge(p.edge)))
             })
             .collect();
         Position {
@@ -408,15 +578,18 @@ impl Position {
                                 matches!(st.node[n as usize], Some(pc)
                                     if pc.owner == owner && pc.building == Building::Settlement)
                             })
+                            .map(|n| Ref::Named(canonical_node(n)))
                             .collect(),
                         cities: (0..N_NODES as u8)
                             .filter(|&n| {
                                 matches!(st.node[n as usize], Some(pc)
                                     if pc.owner == owner && pc.building == Building::City)
                             })
+                            .map(|n| Ref::Named(canonical_node(n)))
                             .collect(),
                         roads: (0..N_EDGES as u8)
                             .filter(|&e| st.edge[e as usize] == Some(owner))
+                            .map(|e| Ref::Named(canonical_edge(e)))
                             .collect(),
                         hand: Resource::ALL
                             .iter()

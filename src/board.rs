@@ -40,6 +40,81 @@ pub const HEX_AXIAL: [(i32, i32); N_HEXES] = [
 
 const CORNER_OFFSETS: [(i32, i32); 6] = [(0, 2), (1, 1), (1, -1), (0, -2), (-1, -1), (-1, 1)];
 
+/// Compass names for a hex's six corners, in `CORNER_OFFSETS` order.
+///
+/// Rows run top to bottom, so negative y is north. These names exist so a
+/// board can be transcribed from a picture: "the settlement on the north
+/// corner of hex 7" is something a person or a vision model can actually see,
+/// where "node 37" is not.
+pub const CORNER_NAMES: [&str; 6] = ["S", "SE", "NE", "N", "NW", "SW"];
+
+/// Compass names for a hex's six sides. Side `k` joins corner `k` to corner
+/// `k+1`.
+pub const SIDE_NAMES: [&str; 6] = ["SE", "E", "NE", "NW", "W", "SW"];
+
+/// The node at a named corner of a hex, e.g. `corner_node(7, "N")`.
+///
+/// Several hexes share each corner, so the same intersection has up to three
+/// names. That redundancy is useful: two independent readings of the same
+/// board should resolve to the same node, and disagree loudly if one is wrong.
+pub fn corner_node(hex: u8, corner: &str) -> Option<u8> {
+    let k = CORNER_NAMES
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(corner))?;
+    if hex as usize >= N_HEXES {
+        return None;
+    }
+    Some(topology().hex_nodes[hex as usize][k])
+}
+
+/// The edge on a named side of a hex, e.g. `side_edge(7, "NW")`.
+pub fn side_edge(hex: u8, side: &str) -> Option<u8> {
+    let k = SIDE_NAMES.iter().position(|c| c.eq_ignore_ascii_case(side))?;
+    if hex as usize >= N_HEXES {
+        return None;
+    }
+    let topo = topology();
+    let a = topo.hex_nodes[hex as usize][k];
+    let b = topo.hex_nodes[hex as usize][(k + 1) % 6];
+    (0..N_EDGES as u8).find(|&e| {
+        let [x, y] = topo.edge_nodes[e as usize];
+        (x == a && y == b) || (x == b && y == a)
+    })
+}
+
+/// Every way of naming a node, for printing a transcription key.
+pub fn node_names(node: u8) -> Vec<String> {
+    let topo = topology();
+    let mut out = Vec::new();
+    for h in 0..N_HEXES {
+        for k in 0..6 {
+            if topo.hex_nodes[h][k] == node {
+                out.push(format!("{h}:{}", CORNER_NAMES[k]));
+            }
+        }
+    }
+    out
+}
+
+/// Every way of naming an edge.
+pub fn edge_names(edge: u8) -> Vec<String> {
+    let topo = topology();
+    let [a, b] = topo.edge_nodes[edge as usize];
+    let mut out = Vec::new();
+    for h in 0..N_HEXES {
+        for k in 0..6 {
+            let (x, y) = (
+                topo.hex_nodes[h][k],
+                topo.hex_nodes[h][(k + 1) % 6],
+            );
+            if (x == a && y == b) || (x == b && y == a) {
+                out.push(format!("{h}:{}", SIDE_NAMES[k]));
+            }
+        }
+    }
+    out
+}
+
 /// Immutable board graph, shared by every game.
 pub struct Topology {
     /// Node ids of each hex's 6 corners (clockwise from top).

@@ -139,3 +139,36 @@ pub fn board_table(b: &Board) -> String {
     }
     out
 }
+
+/// The board with each hex's index shown, as a key for transcribing a
+/// position from a picture. Hexes are numbered 0-18 in rows of 3/4/5/4/3.
+pub fn board_with_hex_numbers(b: &Board) -> String {
+    let rows: [(usize, usize); 5] = [(0, 3), (3, 7), (7, 12), (12, 16), (16, 19)];
+    let mut out = String::new();
+    out.push_str("hex numbers, terrain and tokens (* = robber)\n\n");
+    for &(lo, hi) in rows.iter() {
+        let indent = (5 - (hi - lo)) * 5;
+        // Index line.
+        out.push_str(&" ".repeat(indent));
+        for h in lo..hi {
+            let _ = write!(out, "  [{h:>2}]    ");
+        }
+        out.push('\n');
+        // Terrain and token line.
+        out.push_str(&" ".repeat(indent));
+        for h in lo..hi {
+            let n = b.numbers[h];
+            let num = if n == 0 {
+                " -".to_string()
+            } else {
+                format!("{n:>2}")
+            };
+            let robber = if b.robber as usize == h { '*' } else { ' ' };
+            // Terrain codes are a fixed five characters so the columns line
+            // up under their index labels.
+            let _ = write!(out, " {} {}{} ", terrain_code(b.terrain[h]), num, robber);
+        }
+        out.push_str("\n\n");
+    }
+    out
+}

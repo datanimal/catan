@@ -256,7 +256,49 @@ catan_sim eval --position pos.json --rollouts 2000 --json   # for an overlay
 
 `position.json` is the integration contract: anything that can emit it can be
 evaluated, which keeps platform-specific log parsing at the edges rather than
-in the engine. Positions are **validated** against the same invariants the
+in the engine.
+
+### Writing a position from a picture
+
+Positions are addressed in board terms, not internal indices, because nobody
+looking at a picture of a board knows that a settlement is on node 37:
+
+```json
+"settlements": ["11:S", "15:S"],
+"cities":      ["4:S"],
+"roads":       ["4:SW", "8:E", "11:SE"]
+```
+
+`<hex>:<corner>` for buildings and `<hex>:<side>` for roads, with hexes
+numbered 0-18 in rows of 3/4/5/4/3. Corners are N, NE, SE, S, SW, NW; sides
+are NE, E, SE, SW, W, NW. Neighbouring hexes share corners, so each spot has
+up to three names and any of them works — pick whichever is easiest to see.
+Raw indices are still accepted.
+
+```bash
+catan_sim key --seed 3                   # the board with its hex numbers
+catan_sim key --position pos.json        # the key for a board you already have
+```
+
+### Catching a misreading
+
+`to_state` rejects *illegal* positions, but a transcription slip usually
+produces a perfectly legal board that is simply wrong — and a confident number
+computed from the wrong board is the worst outcome for something on screen.
+`check_composition` catches those by checking the board against the standard
+recipe, which is fixed: exactly 4 forest, 4 pasture, 4 fields, 3 hills, 3
+mountains, 1 desert, and one specific multiset of number tokens.
+
+It is specific enough to point at the mistake. Reading a 6 as an 8 reports
+`number tokens do not match a standard board: [8] too many, [6] missing`, and
+reading a pasture as a field reports `3 pasture hexes, but a standard board
+has 4` alongside `5 fields hexes`. These are warnings rather than errors,
+since variants legitimately use other mixes, but `eval` prints them loudly
+before any probability.
+
+One practical note for live use: **the board only has to be transcribed once
+per game.** Terrain, tokens and ports do not move. Per turn only the pieces,
+the robber and the card counts change, which is a much smaller update. Positions are **validated** against the same invariants the
 engine holds itself to, so a transcription slip is reported instead of being
 silently scored — a win probability computed from an impossible board is worse
 than no number at all. Rejected cases include two buildings on one

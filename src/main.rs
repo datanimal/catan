@@ -113,6 +113,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         check_rollouts: usize,
     },
+    /// Print the board with its hex numbers and the naming scheme, so a
+    /// position can be transcribed from a picture.
+    Key {
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, value_enum, default_value = "balanced")]
+        layout: LayoutArg,
+        /// Read the board out of this position file instead of generating one.
+        #[arg(long)]
+        position: Option<String>,
+    },
     /// Write an example position file, taken from a real simulated game.
     #[command(name = "position")]
     PositionCmd {
@@ -383,6 +394,37 @@ fn main() {
             }
         }
 
+        Cmd::Key {
+            seed,
+            layout,
+            position,
+        } => {
+            use catan_sim::board::{CORNER_NAMES, SIDE_NAMES};
+            let b = match &position {
+                Some(path) => match catan_sim::position::Position::load(path)
+                    .and_then(|p| p.to_state().map(|s| s.board))
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("could not read {path}: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                None => {
+                    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+                    Board::new(layout_of(layout), false, &mut rng)
+                }
+            };
+            println!("{}", render::board_with_hex_numbers(&b));
+            println!("corners of a hex: {}", CORNER_NAMES.join(", "));
+            println!("sides of a hex:   {}", SIDE_NAMES.join(", "));
+            println!();
+            println!("Write a settlement or city as \"<hex>:<corner>\", e.g. \"7:N\" for the");
+            println!("north corner of hex 7. Write a road as \"<hex>:<side>\", e.g. \"7:NW\".");
+            println!("Neighbouring hexes share corners, so the same spot has up to three");
+            println!("names and any of them works -- pick whichever is easiest to see.");
+        }
+
         Cmd::PositionCmd {
             seed,
             until_vp,
@@ -455,6 +497,16 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+            // A misread board is usually a legal board, so the legality check
+            // above cannot catch it. The recipe check can.
+            let warnings = pos.check_composition();
+            if !warnings.is_empty() && !json {
+                eprintln!("warning: this does not look like a standard board:");
+                for w in &warnings {
+                    eprintln!("  - {w}");
+                }
+                eprintln!("  numbers below are computed from it as given.\n");
+            }
             let n = st.n_players();
             let names: Vec<String> = pos
                 .players
