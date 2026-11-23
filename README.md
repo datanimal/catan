@@ -298,7 +298,34 @@ before any probability.
 
 One practical note for live use: **the board only has to be transcribed once
 per game.** Terrain, tokens and ports do not move. Per turn only the pieces,
-the robber and the card counts change, which is a much smaller update. Positions are **validated** against the same invariants the
+the robber and the card counts change, which is a much smaller update.
+
+### Worked example from real screenshots
+
+`examples/board-from-screenshot.json` is a board read off phone screenshots of
+an actual game. It passes `catan_sim validate`, and rendering it back with
+`catan_sim key` reproduces the screenshot hex for hex. The recipe check is
+what makes that claim worth anything: a misread token or terrain would have
+broken the fixed composition and been reported.
+
+What a screenshot of this kind carries, in practice:
+
+| | readable? |
+|---|---|
+| terrain, number tokens, robber | yes, and recipe-checked |
+| ports (kind and rough position) | kind yes; exact coastal edge is the least certain part |
+| victory points, per player | yes, from the panels |
+| resource card *count*, per player | yes |
+| development cards held, per player | yes |
+| knights played, longest-road length | yes |
+| **exact intersection of each building** | **this is the hard part** |
+
+The panels alone give victory points, hand sizes, development-card counts,
+knights and road length for every player — nearly the whole spectator feature
+set, with no board reading at all. What they do not give is engine size in
+pips or resource breadth, which need the buildings placed to specific
+intersections, and that is where phone-resolution captures run out of
+precision. Positions are **validated** against the same invariants the
 engine holds itself to, so a transcription slip is reported instead of being
 silently scored — a win probability computed from an impossible board is worse
 than no number at all. Rejected cases include two buildings on one

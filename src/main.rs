@@ -138,6 +138,12 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "tuned,city_builder,dev_rush,expander")]
         players: Vec<String>,
     },
+    /// Check a transcribed position without evaluating it: is it a legal
+    /// board, and does it match the standard recipe?
+    Validate {
+        #[arg(long)]
+        position: String,
+    },
     /// Evaluate a position supplied from outside the simulator.
     Eval {
         /// Position JSON, as written by `position` or by your own exporter.
@@ -470,6 +476,46 @@ fn main() {
                     );
                 }
                 Err(e) => eprintln!("could not write {out}: {e}"),
+            }
+        }
+
+        Cmd::Validate { position } => {
+            use catan_sim::position::Position;
+            let pos = match Position::load(&position) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("could not read {position}: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let warnings = pos.check_composition();
+            let legal = pos.to_state();
+            println!("=== {position} ===");
+            match &legal {
+                Ok(st) => {
+                    println!("legal: yes");
+                    println!(
+                        "scores (public): {:?}",
+                        (0..st.n_players() as u8).map(|p| st.vp_public(p)).collect::<Vec<_>>()
+                    );
+                    println!(
+                        "engine size (pips): {:?}",
+                        (0..st.n_players() as u8).map(|p| st.raw_pips(p)).collect::<Vec<_>>()
+                    );
+                    println!("longest road: {:?}  largest army: {:?}", st.longest_road, st.largest_army);
+                }
+                Err(e) => println!("legal: NO -- {e}"),
+            }
+            if warnings.is_empty() {
+                println!("board recipe: matches a standard board");
+            } else {
+                println!("board recipe: does NOT match a standard board");
+                for w in &warnings {
+                    println!("  - {w}");
+                }
+            }
+            if legal.is_err() || !warnings.is_empty() {
+                std::process::exit(1);
             }
         }
 
