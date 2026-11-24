@@ -672,6 +672,62 @@ of what 50,000 games can resolve. It is worth taking when it is *free* --
 when the spot that sets up the city is one you wanted anyway -- and not worth
 distorting a placement for. Defaulted to zero so earlier results stand.
 
+## Cities: getting there first, and what comes after
+
+**The first city predicts the winner, but mostly as a symptom.** Over 30,000
+games, the first player to put up a city wins **37.3%** of the time against a
+25% baseline, and earlier is better: 39.2% when it goes up inside the first
+twenty turns, drifting down to about 34% by turn sixty.
+
+The split that matters is whether they were already level with the lead when
+they built it:
+
+| | n | wins |
+|---|---|---|
+| already level with or ahead of the leader | 21,802 | **42.2%** |
+| behind at the time | 8,153 | **24.3%** |
+
+Racing to a city from behind lands exactly on chance. The first city is
+largely a marker of an already-strong position rather than the thing that
+creates one. What a city *is* close to essential for: players who build at
+least one win 33.1%, players who build none win **3.2%**.
+
+**A second city versus two development cards.** They compete for the same ore
+and grain, so once one city is up the question is which to take. Preferring
+the cards is worth about **+0.4 points of win rate** — small, but consistent
+across three independent runs (+0.3, +0.4, +0.4 at 25k, 70k and 45k games an
+arm), which together clear two standard errors.
+
+Isolating that is harder than it looks, and two earlier attempts measured
+nothing useful:
+
+- Discounting *every* city after the first (`later_city_discount`) made the
+  bot build less of everything, development cards included (5.07 down to
+  4.41), because a city doubles a hex and fewer cities means less income to
+  buy anything with. It has to reach `target_cost` as well as the build
+  decision, or the bot goes on saving for a city it has decided against and
+  builds it anyway once the ore piles up.
+- The useful knob is `dev_over_second_city`, which fires only at the actual
+  choice point: one city already up, and the hand covering both a second city
+  and two development cards right now. That produces a real substitution —
+  cities 1.68 to 1.61, cards 5.05 to 5.30.
+
+**And it depends on ore**, which is the sharper finding:
+
+| rule | win rate |
+|---|---|
+| never prefer the cards | 25.3% |
+| always prefer the cards | 25.7% |
+| prefer them only when ore is plentiful (>= 0.18/roll) | **25.6%** |
+| prefer them only when ore is scarce (<= 0.12/roll) | **25.3%** |
+
+The ore-poor cases contribute none of the benefit. If ore is hard to come by,
+three of it in hand is a chance that may not return, and the city is right;
+if ore is plentiful you can rebuild toward one easily and the cards are
+better. `tuned` now carries the rule gated on ore production, which makes it
+about 0.4 points stronger than the version in results reported before this
+section.
+
 ## Known limitations
 
 - Trade offers are enumerated as 1-for-1 and 2-for-1 bundles. That covers the

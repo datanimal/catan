@@ -347,6 +347,18 @@ impl Game {
                 // The settlement piece goes back to the player's supply.
                 self.st.players[p as usize].settlements_left += 1;
                 self.st.players[p as usize].metrics.cities_built += 1;
+                if self.st.players[p as usize].metrics.first_city_turn == 0 {
+                    let turn = self.st.turn;
+                    let vp = self.st.vp(p);
+                    let lead = (0..self.st.n_players() as u8)
+                        .map(|q| self.st.vp(q))
+                        .max()
+                        .unwrap_or(0);
+                    let m = &mut self.st.players[p as usize].metrics;
+                    m.first_city_turn = turn;
+                    m.vp_at_first_city = vp;
+                    m.leader_vp_at_first_city = lead;
+                }
             }
 
             Action::BuyDev => {

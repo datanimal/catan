@@ -73,6 +73,14 @@ pub struct PlayerMetrics {
     pub roads_built: u32,
     pub settlements_built: u32,
     pub cities_built: u32,
+    /// Turn the player's first city went up, or 0 if they never built one.
+    /// Recorded to ask whether reaching a city first predicts winning.
+    pub first_city_turn: u32,
+    /// Their victory points at that moment, and the best score at the table,
+    /// so the question "were they already winning anyway?" can be separated
+    /// from "did the city do it?".
+    pub vp_at_first_city: u8,
+    pub leader_vp_at_first_city: u8,
     pub trades_proposed: u32,
     pub trades_accepted_by_others: u32,
     pub trades_accepted_for_others: u32,

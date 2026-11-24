@@ -114,6 +114,23 @@ pub struct Weights {
     /// Weight on the sequential plan: how strongly to pursue a settlement
     /// several roads away that is better than anything already in reach.
     pub plan_drive: f64,
+    /// Penalty applied to a city *only* at the exact choice point: one city
+    /// is already up, and the hand can pay for either a second city or two
+    /// development cards right now. This isolates the substitution, where
+    /// `later_city_discount` also changes what the bot saves for and so ends
+    /// up building less of everything.
+    pub dev_over_second_city: f64,
+    /// Bounds on own ore production (expected ore cards per roll) within
+    /// which `dev_over_second_city` applies. Used to test whether the choice
+    /// depends on how hard ore is to come by: a player swimming in ore can
+    /// rebuild toward a city easily, while for an ore-poor player three ore
+    /// in hand may be a chance that does not come again.
+    pub dev_pref_min_ore: f64,
+    pub dev_pref_max_ore: f64,
+    /// Subtracted from the score of every city after the first. Cities and
+    /// development cards compete for the same ore and grain, so this is the
+    /// knob that decides which wins at the margin once one city is up.
+    pub later_city_discount: f64,
     /// Weight on the cards the *second* opening settlement pays out at once:
     /// one per adjacent producing hex. Those cards arrive before the first
     /// roll, so a spot touching three producing hexes starts a turn ahead of
@@ -136,7 +153,7 @@ pub struct Weights {
 }
 
 /// The tunable parameters, as a flat list for search.
-pub const PARAM_KEYS: [&str; 24] = [
+pub const PARAM_KEYS: [&str; 28] = [
     "w_city",
     "w_settlement",
     "w_road",
@@ -161,6 +178,10 @@ pub const PARAM_KEYS: [&str; 24] = [
     "block_drive",
     "plan_drive",
     "setup_payout",
+    "later_city_discount",
+    "dev_over_second_city",
+    "dev_pref_min_ore",
+    "dev_pref_max_ore",
 ];
 
 /// Plausible bounds for each parameter, so a search cannot wander into
@@ -187,6 +208,10 @@ pub fn param_bounds(key: &str) -> (f64, f64) {
         "block_drive" => (0.0, 4.0),
         "plan_drive" => (0.0, 4.0),
         "setup_payout" => (0.0, 8.0),
+        "later_city_discount" => (-20.0, 60.0),
+        "dev_over_second_city" => (0.0, 120.0),
+        "dev_pref_min_ore" => (0.0, 1.0),
+        "dev_pref_max_ore" => (0.0, 99.0),
         _ => (0.0, 1.0),
     }
 }
@@ -219,6 +244,10 @@ impl Weights {
             "block_drive" => self.block_drive,
             "plan_drive" => self.plan_drive,
             "setup_payout" => self.setup_payout,
+            "later_city_discount" => self.later_city_discount,
+            "dev_over_second_city" => self.dev_over_second_city,
+            "dev_pref_min_ore" => self.dev_pref_min_ore,
+            "dev_pref_max_ore" => self.dev_pref_max_ore,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -252,6 +281,10 @@ impl Weights {
             "block_drive" => self.block_drive = v,
             "plan_drive" => self.plan_drive = v,
             "setup_payout" => self.setup_payout = v,
+            "later_city_discount" => self.later_city_discount = v,
+            "dev_over_second_city" => self.dev_over_second_city = v,
+            "dev_pref_min_ore" => self.dev_pref_min_ore = v,
+            "dev_pref_max_ore" => self.dev_pref_max_ore = v,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -326,6 +359,10 @@ impl Default for Weights {
             // Off by default: measured, and weighting it only ever hurt. See
             // the README. The bots already collect 2.80 of the 3 available
             // cards as a by-product of preferring pips.
+            dev_over_second_city: 0.0,
+            dev_pref_min_ore: 0.0,
+            dev_pref_max_ore: 99.0,
+            later_city_discount: 0.0,
             setup_payout: 0.0,
             forced_opening: Vec::new(),
             noise: 0.75,
@@ -366,6 +403,13 @@ impl Weights {
                 w.propose_drive = 2.248;
                 w.accept_floor = 0.279;
                 w.leader_wariness = 3.835;
+                // Once one city is up, a second competes with development
+                // cards for the same ore and grain. Preferring the cards is
+                // worth about +0.4 points of win rate, but only when ore is
+                // plentiful enough to rebuild toward a city easily; gated on
+                // ore production for that reason. See the README.
+                w.dev_over_second_city = 100.0;
+                w.dev_pref_min_ore = 0.18;
                 w.knight_timing = 15.0;
                 w.reach_decay = 0.8;
                 w.contest_drive = 1.5;
@@ -981,7 +1025,15 @@ impl HeuristicBot {
         let can_settle = v.settlements_left() > 0 && !v.settlement_spots().is_empty();
         let mut best = (f64::MIN, COST_DEV);
         if can_city {
-            best = best.max_by(self.w.w_city, COST_CITY);
+            // The same discount the build decision uses, or the bot would go
+            // on *saving* for a city it has decided not to prefer and would
+            // build it anyway once the ore piled up.
+            let w = if MAX_CITIES - v.cities_left() >= 1 {
+                self.w.w_city - self.w.later_city_discount
+            } else {
+                self.w.w_city
+            };
+            best = best.max_by(w, COST_CITY);
         }
         if can_settle {
             best = best.max_by(self.w.w_settlement, COST_SETTLEMENT);
@@ -1256,7 +1308,29 @@ impl HeuristicBot {
 
             Action::BuildCity(n) => {
                 // A city doubles that node's yield.
-                self.w.w_city + 2.2 * v.board().node_pips(n) as f64
+                let base = self.w.w_city + 2.2 * v.board().node_pips(n) as f64;
+                // Cities after the first compete with development cards for
+                // the same ore and grain. Discounting them shifts that margin
+                // without forbidding anything.
+                if MAX_CITIES - v.cities_left() >= 1 {
+                    // Two development cards cost two each of wool, grain and
+                    // ore. When the hand covers both that and a city, this is
+                    // the choice in question.
+                    let two_devs: Res = [0, 0, 2, 2, 2];
+                    let ore_rate = v.my_rate()[Resource::Ore.idx()];
+                    let both_affordable = self.w.dev_over_second_city > 0.0
+                        && can_afford(&hand, &two_devs)
+                        && v.dev_deck_size() >= 2
+                        && ore_rate >= self.w.dev_pref_min_ore
+                        && ore_rate <= self.w.dev_pref_max_ore;
+                    if both_affordable {
+                        base - self.w.dev_over_second_city
+                    } else {
+                        base - self.w.later_city_discount
+                    }
+                } else {
+                    base
+                }
             }
             Action::BuildSettlement(n) => {
                 self.w.w_settlement + 1.3 * self.node_value(v, n) + self.block_value(v, n)
