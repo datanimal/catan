@@ -114,6 +114,12 @@ pub struct Weights {
     /// Weight on the sequential plan: how strongly to pursue a settlement
     /// several roads away that is better than anything already in reach.
     pub plan_drive: f64,
+    /// Weight on the cards the *second* opening settlement pays out at once:
+    /// one per adjacent producing hex. Those cards arrive before the first
+    /// roll, so a spot touching three producing hexes starts a turn ahead of
+    /// one touching two, and a payout that happens to complete a road or a
+    /// development card is worth more than three unrelated cards.
+    pub setup_payout: f64,
     /// Random jitter added to every score, to break ties and decorrelate.
     pub noise: f64,
     /// Intersections to take for the opening settlements, in order, when they
@@ -130,7 +136,7 @@ pub struct Weights {
 }
 
 /// The tunable parameters, as a flat list for search.
-pub const PARAM_KEYS: [&str; 23] = [
+pub const PARAM_KEYS: [&str; 24] = [
     "w_city",
     "w_settlement",
     "w_road",
@@ -154,6 +160,7 @@ pub const PARAM_KEYS: [&str; 23] = [
     "contest_drive",
     "block_drive",
     "plan_drive",
+    "setup_payout",
 ];
 
 /// Plausible bounds for each parameter, so a search cannot wander into
@@ -179,6 +186,7 @@ pub fn param_bounds(key: &str) -> (f64, f64) {
         "contest_drive" => (0.0, 4.0),
         "block_drive" => (0.0, 4.0),
         "plan_drive" => (0.0, 4.0),
+        "setup_payout" => (0.0, 8.0),
         _ => (0.0, 1.0),
     }
 }
@@ -210,6 +218,7 @@ impl Weights {
             "contest_drive" => self.contest_drive,
             "block_drive" => self.block_drive,
             "plan_drive" => self.plan_drive,
+            "setup_payout" => self.setup_payout,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -242,6 +251,7 @@ impl Weights {
             "contest_drive" => self.contest_drive = v,
             "block_drive" => self.block_drive = v,
             "plan_drive" => self.plan_drive = v,
+            "setup_payout" => self.setup_payout = v,
             other => panic!("unknown weight '{other}'"),
         }
     }
@@ -313,6 +323,10 @@ impl Default for Weights {
             // null may be an artefact of having no lookahead.
             block_drive: 0.0,
             plan_drive: 1.0,
+            // Off by default: measured, and weighting it only ever hurt. See
+            // the README. The bots already collect 2.80 of the 3 available
+            // cards as a by-product of preferring pips.
+            setup_payout: 0.0,
             forced_opening: Vec::new(),
             noise: 0.75,
             random_opening: false,
@@ -886,6 +900,35 @@ impl HeuristicBot {
         s
     }
 
+    /// Value of the cards the second opening settlement pays immediately.
+    ///
+    /// Only the second settlement pays, one card per adjacent producing hex,
+    /// before anyone rolls. Three cards beat two, and three that complete
+    /// something beat three that do not: brick with lumber is a road on turn
+    /// one, and ore with wool and grain is a development card.
+    fn setup_payout_value(&self, v: &View, n: u8) -> f64 {
+        // The first settlement pays nothing, so this only applies to the
+        // second -- by which point one is already placed.
+        if v.settlements_left() != MAX_SETTLEMENTS - 1 {
+            return 0.0;
+        }
+        let b = v.board();
+        let mut pay = ZERO;
+        for &h in crate::board::topology().node_hexes[n as usize].iter() {
+            if let Some(r) = b.hex_resource(h) {
+                pay[r.idx()] += 1;
+            }
+        }
+        let cards = res_total(&pay) as f64;
+        let completes_road =
+            pay[Resource::Brick.idx()] >= 1 && pay[Resource::Lumber.idx()] >= 1;
+        let completes_dev = pay[Resource::Ore.idx()] >= 1
+            && pay[Resource::Wool.idx()] >= 1
+            && pay[Resource::Grain.idx()] >= 1;
+        self.w.setup_payout
+            * (cards + 2.0 * completes_road as u8 as f64 + 2.0 * completes_dev as u8 as f64)
+    }
+
     /// Extra value for a node that covers resources we barely produce.
     fn complement_bonus(&self, v: &View, n: u8) -> f64 {
         let rate = v.my_rate();
@@ -1171,7 +1214,10 @@ impl HeuristicBot {
             Action::Roll => 0.0,
 
             Action::PlaceInitialSettlement(n) => {
-                100.0 + self.node_value(v, n) + self.complement_bonus(v, n)
+                100.0
+                    + self.node_value(v, n)
+                    + self.complement_bonus(v, n)
+                    + self.setup_payout_value(v, n)
             }
             Action::PlaceInitialRoad(e) => 100.0 + self.road_value(v, e),
 

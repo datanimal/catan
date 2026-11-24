@@ -625,6 +625,31 @@ screen.
 Recalibrating against logged human games is the other high-value step, and the
 same adapter unlocks it.
 
+## The opening payout
+
+The second opening settlement pays out immediately -- one card for each
+adjacent producing hex, before anyone rolls -- and the first pays nothing.
+That is implemented, and `tests/setup_payout.rs` pins it down: the right cards
+for the right hexes, one per producing hex, never more than three, the first
+settlement paying nothing, and the bank balancing. It is recorded as
+`setup_income` and deliberately kept out of `produced`, since those cards came
+from no roll and would otherwise distort the dice-luck baseline.
+
+Whether it is worth *playing for* is a separate question, and the answer is
+no. Weighting it in the second settlement's choice (`setup_payout`) is flat at
+small values and clearly harmful at large ones:
+
+| `setup_payout` | 0 | 0.5 | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|---|
+| win rate | 25.2% | 25.1% | 25.1% | 24.2% | 22.4% | 21.2% |
+
+The reason is visible in the data: bots already collect **2.80 of the 3
+available cards** without any such term, taking a three-hex second settlement
+73-84% of the time simply because three-hex intersections carry more pips.
+There is only 0.2 cards of headroom, the payout is 4.2% of a whole game's
+inflow, and buying it means compromising a settlement that pays out every roll
+for the next eighty turns. The knob is kept, documented and defaulted to zero.
+
 ## Known limitations
 
 - Trade offers are enumerated as 1-for-1 and 2-for-1 bundles. That covers the
