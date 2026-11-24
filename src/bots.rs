@@ -903,30 +903,63 @@ impl HeuristicBot {
     /// Value of the cards the second opening settlement pays immediately.
     ///
     /// Only the second settlement pays, one card per adjacent producing hex,
-    /// before anyone rolls. Three cards beat two, and three that complete
-    /// something beat three that do not: brick with lumber is a road on turn
-    /// one, and ore with wool and grain is a development card.
+    /// before anyone rolls. Counting those cards is the obvious reading and
+    /// it is the wrong one: what matters is whether the payout plus *one
+    /// roll* completes something, because a city on the first turn is two
+    /// points and a doubled hex while the board is still empty.
+    ///
+    /// So each roll is checked against the payout combined with what both
+    /// settlements would produce on it, and the best build that becomes
+    /// affordable is weighted by that roll's probability. An opening paying
+    /// two ore and a grain, next to an ore and a grain that share a number,
+    /// is one roll from a city; the same three cards spread over unrelated
+    /// numbers are just three cards.
     fn setup_payout_value(&self, v: &View, n: u8) -> f64 {
         // The first settlement pays nothing, so this only applies to the
         // second -- by which point one is already placed.
         if v.settlements_left() != MAX_SETTLEMENTS - 1 {
             return 0.0;
         }
+        let topo = crate::board::topology();
         let b = v.board();
         let mut pay = ZERO;
-        for &h in crate::board::topology().node_hexes[n as usize].iter() {
+        for &h in topo.node_hexes[n as usize].iter() {
             if let Some(r) = b.hex_resource(h) {
                 pay[r.idx()] += 1;
             }
         }
-        let cards = res_total(&pay) as f64;
-        let completes_road =
-            pay[Resource::Brick.idx()] >= 1 && pay[Resource::Lumber.idx()] >= 1;
-        let completes_dev = pay[Resource::Ore.idx()] >= 1
-            && pay[Resource::Wool.idx()] >= 1
-            && pay[Resource::Grain.idx()] >= 1;
-        self.w.setup_payout
-            * (cards + 2.0 * completes_road as u8 as f64 + 2.0 * completes_dev as u8 as f64)
+
+        // Both settlements produce once the dice start.
+        let mut mine: Vec<u8> = vec![n];
+        for q in 0..N_NODES as u8 {
+            if v.node(q).map(|pc| pc.owner == v.me()).unwrap_or(false) {
+                mine.push(q);
+            }
+        }
+
+        // Cards are worth something on their own.
+        let mut value = 0.5 * res_total(&pay) as f64;
+        for roll in 2..=12u8 {
+            let mut hand = pay;
+            for &q in &mine {
+                for &h in topo.node_hexes[q as usize].iter() {
+                    if b.numbers[h as usize] == roll {
+                        if let Some(r) = b.hex_resource(h) {
+                            hand[r.idx()] += 1;
+                        }
+                    }
+                }
+            }
+            // Only a city counts. A road or a development card is one roll
+            // away from almost every opening, so crediting those just adds
+            // noise to every choice; a city is available in about one opening
+            // in seventeen, and is worth two points and a doubled hex while
+            // the board is still empty.
+            if can_afford(&hand, &COST_CITY) {
+                value += 10.0 * crate::types::prob(roll);
+            }
+        }
+        self.w.setup_payout * value
     }
 
     /// Extra value for a node that covers resources we barely produce.

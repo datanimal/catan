@@ -635,20 +635,42 @@ settlement paying nothing, and the bank balancing. It is recorded as
 `setup_income` and deliberately kept out of `produced`, since those cards came
 from no roll and would otherwise distort the dice-luck baseline.
 
-Whether it is worth *playing for* is a separate question, and the answer is
-no. Weighting it in the second settlement's choice (`setup_payout`) is flat at
-small values and clearly harmful at large ones:
+Whether it is worth *playing for* is a subtler question than it first looks,
+and getting it wrong is instructive.
 
-| `setup_payout` | 0 | 0.5 | 1 | 2 | 4 | 8 |
-|---|---|---|---|---|---|---|
-| win rate | 25.2% | 25.1% | 25.1% | 24.2% | 22.4% | 21.2% |
+**Counting the cards is the wrong reading.** Scoring the payout by how many
+cards it is, plus a bonus for holding a whole road or development card, is
+actively harmful: 25.2% down to 21.2% across the weight range. Bots already
+collect **2.80 of the 3 available cards** without any such term, because
+three-hex intersections carry more pips anyway. There is 0.2 cards of
+headroom, the payout is 4.2% of a game's inflow, and buying it means
+compromising a settlement that pays every roll for eighty turns.
 
-The reason is visible in the data: bots already collect **2.80 of the 3
-available cards** without any such term, taking a three-hex second settlement
-73-84% of the time simply because three-hex intersections carry more pips.
-There is only 0.2 cards of headroom, the payout is 4.2% of a whole game's
-inflow, and buying it means compromising a settlement that pays out every roll
-for the next eighty turns. The knob is kept, documented and defaulted to zero.
+**What matters is whether the payout plus one roll completes something.** A
+second settlement paying two ore and a grain, placed so that an ore and a
+grain share a number with the first settlement, is one roll from a *city* --
+two points and a doubled hex while the board is still empty. `setup_payout`
+now scores exactly that: each roll is checked against the payout combined with
+what both settlements produce on it, and only a city counts, because a road or
+a development card is one roll from almost every opening and crediting those
+just adds noise.
+
+Specified that way it stops hurting -- 25.3% at weight 0 and 25.3% at weight
+2, over 50,000 games each -- but it does not measurably help either, and the
+frequency data says why:
+
+| | |
+|---|---|
+| openings with a second settlement one roll from a city | **5.8%** |
+| chance of that roll, within the first round | ~37% |
+| production given up to take it | **1.9 adjusted pips** |
+
+So it is a real play that arises in about one opening in seventeen, and on
+average costs a fifth of a settlement's production to reach. The expected
+effect across all games is around 0.3 points of win rate, which is at the edge
+of what 50,000 games can resolve. It is worth taking when it is *free* --
+when the spot that sets up the city is one you wanted anyway -- and not worth
+distorting a placement for. Defaulted to zero so earlier results stand.
 
 ## Known limitations
 
