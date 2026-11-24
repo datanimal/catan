@@ -35,6 +35,10 @@ pub struct GameConfig {
     pub max_proposals: u8,
     /// Switch off player-to-player trading entirely.
     pub allow_player_trades: bool,
+    /// Play on this exact board instead of generating one. Needed to measure
+    /// openings on a specific board, such as one read off a screenshot.
+    #[serde(default)]
+    pub fixed_board: Option<Board>,
     /// Record the whole table at the start of each turn. Needed to train or
     /// drive a per-turn win-probability estimate; off by default because it
     /// costs a few kilobytes a game.
@@ -53,6 +57,7 @@ impl Default for GameConfig {
             hand_limit: 7,
             max_proposals: 4,
             allow_player_trades: true,
+            fixed_board: None,
             record_timeline: false,
         }
     }
@@ -77,7 +82,10 @@ impl Game {
     pub fn new(cfg: GameConfig, policies: Vec<Box<dyn Policy>>, seed: u64) -> Game {
         assert_eq!(policies.len(), cfg.n_players, "one policy per seat");
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let board = Board::new(cfg.layout, cfg.random_ports, &mut rng);
+        let board = match &cfg.fixed_board {
+            Some(b) => b.clone(),
+            None => Board::new(cfg.layout, cfg.random_ports, &mut rng),
+        };
         let mut st = GameState::new(board, cfg.n_players, cfg.vp_target, cfg.turn_limit);
         st.hand_limit = cfg.hand_limit;
         st.max_proposals = if cfg.allow_player_trades {

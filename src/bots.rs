@@ -116,6 +116,11 @@ pub struct Weights {
     pub plan_drive: f64,
     /// Random jitter added to every score, to break ties and decorrelate.
     pub noise: f64,
+    /// Intersections to take for the opening settlements, in order, when they
+    /// are still free. Used to measure what a specific opening is worth by
+    /// playing it out, rather than by extrapolating fitted coefficients.
+    #[serde(default)]
+    pub forced_opening: Vec<u8>,
     /// Place the opening settlements uniformly at random among the legal
     /// intersections, while playing normally afterwards. Used to get
     /// *exogenous* variation in opening position: when a bot chooses where to
@@ -308,6 +313,7 @@ impl Default for Weights {
             // null may be an artefact of having no lookahead.
             block_drive: 0.0,
             plan_drive: 1.0,
+            forced_opening: Vec::new(),
             noise: 0.75,
             random_opening: false,
         }
@@ -1325,12 +1331,22 @@ impl Policy for HeuristicBot {
     }
 
     fn choose(&mut self, v: &View, actions: &[Action]) -> usize {
-        // Exogenous opening: pick uniformly among the legal intersections so
-        // that opening position is uncorrelated with everything else.
-        if self.w.random_opening
-            && matches!(actions[0], Action::PlaceInitialSettlement(_))
-        {
-            return self.rng.random_range(0..actions.len());
+        if matches!(actions[0], Action::PlaceInitialSettlement(_)) {
+            // A forced opening takes priority: this is the first or second
+            // settlement depending on how many are still in hand.
+            let which = (MAX_SETTLEMENTS - v.settlements_left()) as usize;
+            if let Some(&want) = self.w.forced_opening.get(which) {
+                if let Some(i) = actions.iter().position(
+                    |a| matches!(a, Action::PlaceInitialSettlement(n) if *n == want),
+                ) {
+                    return i;
+                }
+            }
+            // Exogenous opening: pick uniformly among the legal intersections
+            // so that opening position is uncorrelated with everything else.
+            if self.w.random_opening {
+                return self.rng.random_range(0..actions.len());
+            }
         }
         // The road geography is only consulted by placement, road, Road
         // Building and pre-roll knight decisions. Most turns end with a list
@@ -1507,6 +1523,14 @@ impl Strategy {
     /// True when this is the plain random baseline, which cannot be relabelled.
     pub fn is_random(&self) -> bool {
         matches!(self, Strategy::Random)
+    }
+
+    /// Force the opening settlements to specific intersections.
+    pub fn with_forced_opening(mut self, nodes: Vec<u8>) -> Strategy {
+        if let Strategy::Heuristic(w) = &mut self {
+            w.forced_opening = nodes;
+        }
+        self
     }
 
     /// Place the opening settlements at random, for placement experiments.

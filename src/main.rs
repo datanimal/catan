@@ -138,6 +138,29 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "tuned,city_builder,dev_rush,expander")]
         players: Vec<String>,
     },
+    /// Rank the opening intersections on a board, using the values fitted by
+    /// the placement experiment.
+    Spots {
+        /// Board to rank, as a position file.
+        #[arg(long)]
+        position: String,
+        /// How many to list.
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+        /// Intersections already built on, so the distance rule can rule out
+        /// what they block. Accepts "9:N" or a raw index.
+        #[arg(long, value_delimiter = ',')]
+        taken: Option<Vec<String>>,
+        /// Instead of scoring the candidates, play this many games from each
+        /// one and measure how often it wins. Slower, and the real answer.
+        #[arg(long, default_value_t = 0)]
+        simulate: usize,
+        /// Candidates to simulate, taken from the top of the scored list.
+        #[arg(long, default_value_t = 10)]
+        candidates: usize,
+        #[arg(long, value_delimiter = ',', default_value = "tuned,tuned,tuned,tuned")]
+        players: Vec<String>,
+    },
     /// Check a transcribed position without evaluating it: is it a legal
     /// board, and does it match the standard recipe?
     Validate {
@@ -476,6 +499,158 @@ fn main() {
                     );
                 }
                 Err(e) => eprintln!("could not write {out}: {e}"),
+            }
+        }
+
+        Cmd::Spots {
+            position,
+            top,
+            taken,
+            simulate,
+            candidates,
+            players,
+        } => {
+            use catan_sim::position::{Position, Ref};
+            use catan_sim::spots;
+            let pos = match Position::load(&position) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("could not read {position}: {e}");
+                    std::process::exit(2);
+                }
+            };
+            for w in pos.check_composition() {
+                eprintln!("warning: {w}");
+            }
+            let st = match pos.to_state() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let taken_nodes: Vec<u8> = taken
+                .unwrap_or_default()
+                .iter()
+                .map(|t| {
+                    Ref::Named(t.clone())
+                        .node()
+                        .or_else(|_| t.parse::<u8>().map_err(|e| e.to_string()))
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: {e}");
+                            std::process::exit(2);
+                        })
+                })
+                .collect();
+            let ranked = if taken_nodes.is_empty() {
+                spots::rank(&st.board)
+            } else {
+                spots::still_open(&st.board, &taken_nodes)
+            };
+            println!("=== best opening intersections ===");
+            if !taken_nodes.is_empty() {
+                println!("(ruling out {} already-built spots and their neighbours)", taken_nodes.len());
+            }
+            println!(
+                "values are adjusted pips: one adjusted pip = one pip of average production\n"
+            );
+            for (i, s) in ranked.iter().take(top).enumerate() {
+                let port = if s.ports.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "   port: {}",
+                        s.ports
+                            .iter()
+                            .map(|p| match p {
+                                catan_sim::board::PortKind::Generic => "3:1".to_string(),
+                                catan_sim::board::PortKind::Specific(r) =>
+                                    format!("2:1 {}", r.name()),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                println!(
+                    "{:>2}. {:<22} {:>5.1} adj pips   ({} raw pips, {} resources){}",
+                    i + 1,
+                    s.names.join(" = "),
+                    s.total,
+                    s.pips,
+                    s.distinct,
+                    port
+                );
+                println!("    touches {}", s.touches.join(", "));
+                let mix: Vec<String> = catan_sim::types::Resource::ALL
+                    .iter()
+                    .filter(|r| s.by_res[r.idx()] > 0)
+                    .map(|r| format!("{} {}", s.by_res[r.idx()], r.name()))
+                    .collect();
+                print!("    {}", mix.join(", "));
+                if s.pairing > 0.0 {
+                    let mut why = Vec::new();
+                    if s.paired_road > 0 {
+                        why.push(format!("{} brick+lumber on one number", s.paired_road));
+                    }
+                    if s.paired_city > 0 {
+                        why.push(format!("{} grain+ore on one number", s.paired_city));
+                    }
+                    print!("   [{} = +{:.1}]", why.join(", "), s.pairing);
+                }
+                println!("\n");
+            }
+
+            if simulate > 0 {
+                use catan_sim::bots::Strategy;
+                println!("=== played out: {simulate} games from each of the top {candidates} ===");
+                println!(
+                    "seat 0 is forced to open there; the rest place as they see fit. Chance is \
+                     {:.1}%.\n",
+                    100.0 / players.len() as f64
+                );
+                let mut game = GameConfig::default();
+                game.n_players = players.len();
+                game.fixed_board = Some(st.board.clone());
+                game.vp_target = pos.vp_target;
+                let mut results: Vec<(f64, f64, &catan_sim::spots::SpotValue)> = Vec::new();
+                for cand in ranked.iter().take(candidates) {
+                    let mut lineup: Vec<Strategy> = Vec::new();
+                    lineup.push(
+                        Strategy::parse(&players[0])
+                            .unwrap()
+                            .with_forced_opening(vec![cand.node])
+                            .relabel("SPOT"),
+                    );
+                    for name in players.iter().skip(1) {
+                        lineup.push(Strategy::parse(name).unwrap().relabel("field"));
+                    }
+                    let mut sc = catan_sim::sim::SimConfig::with_strategies(lineup, simulate);
+                    sc.base_seed = 0x5907 ^ cand.node as u64;
+                    sc.rotate_seats = false;
+                    sc.game = game.clone();
+                    let recs = catan_sim::sim::run(&sc);
+                    let s = analysis::summarize(&recs);
+                    let me = s.strategies.iter().find(|t| t.name == "SPOT").unwrap();
+                    results.push((me.win_rate, me.mean_vp, cand));
+                }
+                results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                println!(
+                    "{:<22}{:>9}{:>16}{:>8}{:>11}",
+                    "intersection", "win%", "95% CI", "VP", "adj pips"
+                );
+                for (w, vp, c) in &results {
+                    let n = simulate as f64;
+                    let e = 1.96 * (w * (1.0 - w) / n).sqrt();
+                    println!(
+                        "{:<22}{:>8.1}%{:>7.1}-{:<8.1}{:>8.2}{:>11.1}",
+                        c.names.join(" = "),
+                        100.0 * w,
+                        100.0 * (w - e),
+                        100.0 * (w + e),
+                        vp,
+                        c.total
+                    );
+                }
             }
         }
 
@@ -950,6 +1125,7 @@ fn main() {
                 hand_limit,
                 max_proposals: 4,
                 allow_player_trades: !no_trades,
+                fixed_board: None,
                 record_timeline: false,
             };
             let cfg = SimConfig {

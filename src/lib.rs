@@ -25,6 +25,7 @@ pub mod render;
 pub mod rollout;
 pub mod rules;
 pub mod sim;
+pub mod spots;
 pub mod state;
 pub mod tune;
 pub mod types;
